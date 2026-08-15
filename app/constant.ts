@@ -251,6 +251,7 @@ export const Iflytek = {
 export const DeepSeek = {
   ExampleEndpoint: DEEPSEEK_BASE_URL,
   ChatPath: "chat/completions",
+  ResponsesPath: "responses",
 };
 
 export const XAI = {
