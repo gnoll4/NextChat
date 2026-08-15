@@ -5,8 +5,6 @@ import {
   useAccessStore,
   useAppConfig,
   useChatStore,
-  ChatMessageTool,
-  usePluginStore,
 } from "@/app/store";
 import { streamWithThink } from "@/app/utils/chat";
 import {
@@ -22,7 +20,6 @@ import {
   getMessageTextContentWithoutThinking,
   getTimeoutMSByModel,
 } from "@/app/utils";
-import { RequestPayload } from "./openai";
 import { fetch } from "@/app/utils/stream";
 
 export class DeepSeekApi implements LLMApi {
@@ -65,6 +62,7 @@ export class DeepSeekApi implements LLMApi {
 
   async chat(options: ChatOptions) {
     const messages: ChatOptions["messages"] = [];
+  
     for (const v of options.messages) {
       if (v.role === "assistant") {
         const content = getMessageTextContentWithoutThinking(v);
@@ -74,185 +72,219 @@ export class DeepSeekApi implements LLMApi {
         messages.push({ role: v.role, content });
       }
     }
-
-    // 检测并修复消息顺序，确保除system外的第一个消息是user
+  
+    // 确保第一个非 system 消息为 user
     const filteredMessages: ChatOptions["messages"] = [];
     let hasFoundFirstUser = false;
-
+  
     for (const msg of messages) {
       if (msg.role === "system") {
-        // Keep all system messages
         filteredMessages.push(msg);
       } else if (msg.role === "user") {
-        // User message directly added
         filteredMessages.push(msg);
         hasFoundFirstUser = true;
       } else if (hasFoundFirstUser) {
-        // After finding the first user message, all subsequent non-system messages are retained.
         filteredMessages.push(msg);
       }
-      // If hasFoundFirstUser is false and it is not a system message, it will be skipped.
     }
-
+  
     const modelConfig = {
       ...useAppConfig.getState().modelConfig,
       ...useChatStore.getState().currentSession().mask.modelConfig,
-      ...{
-        model: options.config.model,
-        providerName: options.config.providerName,
+      model: options.config.model,
+      providerName: options.config.providerName,
+    };
+  
+    const thinkingLevel =
+      modelConfig.deepseekThinking ?? "high";
+  
+    const reasoningEffort =
+      thinkingLevel === "off"
+        ? "none"
+        : thinkingLevel;
+  
+    /*
+     * DeepSeek Responses API
+     *
+     * off  -> none
+     * low  -> low
+     * high -> high
+     * max  -> max
+     */
+    const requestPayload: any = {
+      model: modelConfig.model,
+  
+      input: filteredMessages.map((msg) => ({
+        role: msg.role,
+        content: msg.content,
+      })),
+  
+      stream: !!options.config.stream,
+  
+      reasoning: {
+        effort: reasoningEffort,
       },
     };
-
-    const thinkingLevel = modelConfig.deepseekThinking ?? "high";
-
-    const requestPayload: RequestPayload & {
-      thinking?: {
-        type: "enabled" | "disabled";
-      };
-      reasoning_effort?: "low" | "high" | "max";
-    } = {
-      messages: filteredMessages,
-      stream: options.config.stream,
-      model: modelConfig.model,
-      temperature: modelConfig.temperature,
-      presence_penalty: modelConfig.presence_penalty,
-      frequency_penalty: modelConfig.frequency_penalty,
-      top_p: modelConfig.top_p,
-    };
-    
+  
+    // 非思考模式下这些参数才真正有效
     if (thinkingLevel === "off") {
-      requestPayload.thinking = {
-        type: "disabled",
-      };
-    } else {
-      requestPayload.thinking = {
-        type: "enabled",
-      };
-      requestPayload.reasoning_effort = thinkingLevel;
+      requestPayload.temperature =
+        modelConfig.temperature;
+  
+      requestPayload.top_p =
+        modelConfig.top_p;
     }
-
-    console.log("[Request] openai payload: ", requestPayload);
-
-    const shouldStream = !!options.config.stream;
+  
+    console.log(
+      "[DeepSeek Responses Request]",
+      requestPayload,
+    );
+  
     const controller = new AbortController();
     options.onController?.(controller);
-
+  
+    /*
+     * DeepSeek 官方原生 Web Search
+     *
+     * tool_choice 默认 auto：
+     * 由模型判断是否需要联网。
+     */
+    const nativeTools = [
+      {
+        type: "web_search",
+      },
+    ];
+  
     try {
-      const chatPath = this.path(DeepSeek.ChatPath);
-      const chatPayload = {
-        method: "POST",
-        body: JSON.stringify(requestPayload),
-        signal: controller.signal,
-        headers: getHeaders(),
-      };
-
-      // make a fetch request
-      const requestTimeoutId = setTimeout(
-        () => controller.abort(),
-        getTimeoutMSByModel(options.config.model),
-      );
-
-      if (shouldStream) {
-        const [tools, funcs] = usePluginStore
-          .getState()
-          .getAsTools(
-            useChatStore.getState().currentSession().mask?.plugin || [],
-          );
+      const responsePath =
+        this.path(DeepSeek.ResponsesPath);
+  
+      /*
+       * 流式
+       */
+      if (options.config.stream) {
         return streamWithThink(
-          chatPath,
+          responsePath,
+  
           requestPayload,
+  
           getHeaders(),
-          tools as any,
-          funcs,
+  
+          nativeTools,
+  
+          {},
+  
           controller,
-          // parseSSE
-          (text: string, runTools: ChatMessageTool[]) => {
-            // console.log("parseSSE", text, runTools);
+  
+          /*
+           * DeepSeek Responses API SSE Parser
+           */
+          (text: string) => {
             const json = JSON.parse(text);
-            const choices = json.choices as Array<{
-              delta: {
-                content: string | null;
-                tool_calls: ChatMessageTool[];
-                reasoning_content: string | null;
-              };
-            }>;
-            const tool_calls = choices[0]?.delta?.tool_calls;
-            if (tool_calls?.length > 0) {
-              const index = tool_calls[0]?.index;
-              const id = tool_calls[0]?.id;
-              const args = tool_calls[0]?.function?.arguments;
-              if (id) {
-                runTools.push({
-                  id,
-                  type: tool_calls[0]?.type,
-                  function: {
-                    name: tool_calls[0]?.function?.name as string,
-                    arguments: args,
-                  },
-                });
-              } else {
-                // @ts-ignore
-                runTools[index]["function"]["arguments"] += args;
-              }
-            }
-            const reasoning = choices[0]?.delta?.reasoning_content;
-            const content = choices[0]?.delta?.content;
-
-            // Skip if both content and reasoning_content are empty or null
+  
+            /*
+             * 思考内容
+             */
             if (
-              (!reasoning || reasoning.length === 0) &&
-              (!content || content.length === 0)
+              json.type ===
+              "response.reasoning_text.delta"
+            ) {
+              return {
+                isThinking: true,
+                content: json.delta ?? "",
+              };
+            }
+  
+            /*
+             * 最终回答
+             */
+            if (
+              json.type ===
+              "response.output_text.delta"
             ) {
               return {
                 isThinking: false,
-                content: "",
+                content: json.delta ?? "",
               };
             }
-
-            if (reasoning && reasoning.length > 0) {
-              return {
-                isThinking: true,
-                content: reasoning,
-              };
-            } else if (content && content.length > 0) {
-              return {
-                isThinking: false,
-                content: content,
-              };
-            }
-
+  
+            /*
+             * 以下事件忽略：
+             *
+             * response.created
+             * response.web_search_call.*
+             * response.output_item.*
+             * response.completed
+             */
             return {
               isThinking: false,
               content: "",
             };
           },
-          // processToolMessage, include tool_calls message and tool call results
-          (
-            requestPayload: RequestPayload,
-            toolCallMessage: any,
-            toolCallResult: any[],
-          ) => {
-            // @ts-ignore
-            requestPayload?.messages?.splice(
-              // @ts-ignore
-              requestPayload?.messages?.length,
-              0,
-              toolCallMessage,
-              ...toolCallResult,
-            );
-          },
+  
+          /*
+           * 原生 web_search 在 DeepSeek 服务端执行，
+           * 不需要 NextChat 本地执行 Tool。
+           */
+          () => {},
+  
           options,
         );
-      } else {
-        const res = await fetch(chatPath, chatPayload);
-        clearTimeout(requestTimeoutId);
-
-        const resJson = await res.json();
-        const message = this.extractMessage(resJson);
-        options.onFinish(message, res);
       }
+  
+      /*
+       * 非流式
+       */
+      const res = await fetch(responsePath, {
+        method: "POST",
+  
+        body: JSON.stringify({
+          ...requestPayload,
+          tools: nativeTools,
+        }),
+  
+        signal: controller.signal,
+  
+        headers: getHeaders(),
+      });
+  
+      if (!res.ok) {
+        const errorText = await res.text();
+  
+        throw new Error(
+          `DeepSeek API Error ${res.status}: ${errorText}`,
+        );
+      }
+  
+      const data = await res.json();
+  
+      const outputText =
+        data.output
+          ?.filter(
+            (item: any) =>
+              item.type === "message",
+          )
+          ?.flatMap(
+            (item: any) =>
+              item.content ?? [],
+          )
+          ?.filter(
+            (item: any) =>
+              item.type === "output_text",
+          )
+          ?.map(
+            (item: any) =>
+              item.text ?? "",
+          )
+          ?.join("") ?? "";
+  
+      options.onFinish(outputText, res);
     } catch (e) {
-      console.log("[Request] failed to make a chat request", e);
+      console.error(
+        "[DeepSeek Responses API Error]",
+        e,
+      );
+  
       options.onError?.(e as Error);
     }
   }
