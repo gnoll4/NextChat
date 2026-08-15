@@ -2,6 +2,7 @@ import {
   CACHE_URL_PREFIX,
   UPLOAD_URL,
   REQUEST_TIMEOUT_MS,
+  REQUEST_TIMEOUT_MS_FOR_THINKING,
 } from "@/app/constant";
 import { MultimodalContent, RequestMessage } from "@/app/client/api";
 import Locale from "@/app/locales";
@@ -224,8 +225,12 @@ export function stream(
       if (!running && runTools.length > 0) {
         const toolCallMessage = {
           role: "assistant",
+          content: "",
+          reasoning_content: currentReasoningContent || undefined,
           tool_calls: [...runTools],
         };
+        
+        currentReasoningContent = "";
         running = true;
         runTools.splice(0, runTools.length); // empty runTools
         return Promise.all(
@@ -419,6 +424,7 @@ export function streamWithThink(
   let isInThinkingMode = false;
   let lastIsThinking = false;
   let lastIsThinkingTagged = false; //between <think> and </think> tags
+  let currentReasoningContent = "";
 
   // animate response to make it looks smooth
   function animateResponseText() {
@@ -450,8 +456,12 @@ export function streamWithThink(
       if (!running && runTools.length > 0) {
         const toolCallMessage = {
           role: "assistant",
+          content: "",
+          reasoning_content: currentReasoningContent || undefined,
           tool_calls: [...runTools],
         };
+        
+        currentReasoningContent = "";
         running = true;
         runTools.splice(0, runTools.length); // empty runTools
         return Promise.all(
@@ -540,7 +550,7 @@ export function streamWithThink(
     };
     const requestTimeoutId = setTimeout(
       () => controller.abort(),
-      REQUEST_TIMEOUT_MS,
+      REQUEST_TIMEOUT_MS_FOR_THINKING,
     );
     fetchEventSource(chatPath, {
       fetch: tauriFetch as any,
@@ -594,6 +604,9 @@ export function streamWithThink(
         }
         try {
           const chunk = parseSSE(text, runTools);
+          if (chunk?.isThinking && chunk.content) {
+            currentReasoningContent += chunk.content;
+          }
           // Skip if content is empty
           if (!chunk?.content || chunk.content.length === 0) {
             return;
