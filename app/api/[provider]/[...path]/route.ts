@@ -63,7 +63,6 @@ async function handle(
 export const GET = handle;
 export const POST = handle;
 
-export const runtime = "edge";
 export const preferredRegion = [
   "arn1",
   "bom1",
