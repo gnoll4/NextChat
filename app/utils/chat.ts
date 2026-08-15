@@ -225,12 +225,8 @@ export function stream(
       if (!running && runTools.length > 0) {
         const toolCallMessage = {
           role: "assistant",
-          content: "",
-          reasoning_content: currentReasoningContent || undefined,
           tool_calls: [...runTools],
         };
-        
-        currentReasoningContent = "";
         running = true;
         runTools.splice(0, runTools.length); // empty runTools
         return Promise.all(
