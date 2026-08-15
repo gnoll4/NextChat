@@ -54,6 +54,7 @@ export interface RequestMessage {
 export interface LLMConfig {
   model: string;
   providerName?: string;
+  deepseekThinking?: "off" | "low" | "high" | "max";
   temperature?: number;
   top_p?: number;
   stream?: boolean;
