@@ -18,7 +18,9 @@
     "prepare": "husky install",
     "proxy-dev": "sh ./scripts/init-proxy.sh && proxychains -f ./scripts/proxychains.conf yarn dev",
     "test": "node --no-warnings --experimental-vm-modules $(yarn bin jest) --watch",
-    "test:ci": "node --no-warnings --experimental-vm-modules $(yarn bin jest) --ci"
+    "test:ci": "node --no-warnings --experimental-vm-modules $(yarn bin jest) --ci",
+    "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
+    "preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview"
   },
   "dependencies": {
     "@fortaine/fetch-event-source": "^3.0.6",
@@ -88,6 +90,8 @@
     "tsx": "^4.16.0",
     "typescript": "5.2.2",
     "watch": "^1.0.2",
+    "@opennextjs/cloudflare": "1.14.7",
+    "wrangler": "4.123.0",
     "webpack": "^5.88.1"
   },
   "resolutions": {
