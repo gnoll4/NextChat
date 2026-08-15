@@ -1,0 +1,44 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "duckduckgo lite",
+    "description": "Search the web for current and up-to-date information.",
+    "version": "v1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://lite.duckduckgo.com"
+    }
+  ],
+  "paths": {
+    "/lite/": {
+      "post": {
+        "operationId": "DuckDuckGoLiteSearch",
+        "description": "Search the web. Use this whenever current or recent information is needed.",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "description": "Search keywords",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "kl",
+            "in": "query",
+            "required": false,
+            "description": "Search region, for example wt-wt or cn-zh",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {}
+  }
+}
