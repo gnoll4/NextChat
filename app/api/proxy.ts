@@ -16,10 +16,46 @@ export async function handle(
   req.nextUrl.searchParams.delete("path");
   req.nextUrl.searchParams.delete("provider");
 
+  const baseUrl = req.headers.get("x-base-url");
+
+  if (!baseUrl) {
+    return NextResponse.json(
+      { error: "Missing x-base-url" },
+      { status: 400 },
+    );
+  }
+  
+  let parsedBaseUrl: URL;
+  
+  try {
+    parsedBaseUrl = new URL(baseUrl);
+  } catch {
+    return NextResponse.json(
+      { error: "Invalid x-base-url" },
+      { status: 400 },
+    );
+  }
+  
+  const allowedHosts = new Set([
+    "lite.duckduckgo.com",
+  ]);
+  
+  if (
+    parsedBaseUrl.protocol !== "https:" ||
+    !allowedHosts.has(parsedBaseUrl.hostname)
+  ) {
+    return NextResponse.json(
+      { error: "Proxy target not allowed" },
+      { status: 403 },
+    );
+  }
+  
   const subpath = params.path.join("/");
-  const fetchUrl = `${req.headers.get(
-    "x-base-url",
-  )}/${subpath}?${req.nextUrl.searchParams.toString()}`;
+  const query = req.nextUrl.searchParams.toString();
+  const normalizedBaseUrl = baseUrl.replace(/\/$/, "");
+  
+  const fetchUrl =
+    `${normalizedBaseUrl}/${subpath}${query ? `?${query}` : ""}`;
   const skipHeaders = ["connection", "host", "origin", "referer", "cookie"];
   const headers = new Headers(
     Array.from(req.headers.entries()).filter((item) => {
@@ -33,17 +69,6 @@ export async function handle(
       return true;
     }),
   );
-  // if dalle3 use openai api key
-    const baseUrl = req.headers.get("x-base-url");
-    if (baseUrl?.includes("api.openai.com")) {
-      if (!serverConfig.apiKey) {
-        return NextResponse.json(
-          { error: "OpenAI API key not configured" },
-          { status: 500 },
-        );
-      }
-      headers.set("Authorization", `Bearer ${serverConfig.apiKey}`);
-    }
 
   const controller = new AbortController();
   const fetchOptions: RequestInit = {
