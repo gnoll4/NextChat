@@ -103,7 +103,14 @@ export class DeepSeekApi implements LLMApi {
       },
     };
 
-    const requestPayload: RequestPayload = {
+    const thinkingLevel = modelConfig.deepseekThinking ?? "high";
+
+    const requestPayload: RequestPayload & {
+      thinking?: {
+        type: "enabled" | "disabled";
+      };
+      reasoning_effort?: "low" | "high" | "max";
+    } = {
       messages: filteredMessages,
       stream: options.config.stream,
       model: modelConfig.model,
@@ -111,9 +118,18 @@ export class DeepSeekApi implements LLMApi {
       presence_penalty: modelConfig.presence_penalty,
       frequency_penalty: modelConfig.frequency_penalty,
       top_p: modelConfig.top_p,
-      // max_tokens: Math.max(modelConfig.max_tokens, 1024),
-      // Please do not ask me why not send max_tokens, no reason, this param is just shit, I dont want to explain anymore.
     };
+    
+    if (thinkingLevel === "off") {
+      requestPayload.thinking = {
+        type: "disabled",
+      };
+    } else {
+      requestPayload.thinking = {
+        type: "enabled",
+      };
+      requestPayload.reasoning_effort = thinkingLevel;
+    }
 
     console.log("[Request] openai payload: ", requestPayload);
 
