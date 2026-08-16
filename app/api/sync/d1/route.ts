@@ -5,6 +5,8 @@ export const dynamic = "force-dynamic";
 const CHUNK_CHAR_SIZE = 400_000;
 const MAX_STATE_CHARS = 16_000_000;
 
+let schemaReadyPromise: Promise<void> | null = null;
+
 function getUserId(request: Request) {
   const email = request.headers.get("cf-access-authenticated-user-email");
   if (email) return email.trim().toLowerCase();
@@ -46,32 +48,45 @@ function getDb() {
 }
 
 async function ensureSchema(db: any) {
-  await db
-    .prepare(
-      `CREATE TABLE IF NOT EXISTS nextchat_sync_meta (
-        user_id TEXT PRIMARY KEY,
-        version TEXT NOT NULL,
-        updated_at INTEGER NOT NULL,
-        chunk_count INTEGER NOT NULL
-      )`,
-    )
-    .run();
+  // Avoid running CREATE TABLE on every sync request in the same Worker
+  // isolate. If initialization fails, clear the cached promise so a later
+  // request can retry.
+  if (!schemaReadyPromise) {
+    schemaReadyPromise = Promise.all([
+      db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS nextchat_sync_meta (
+            user_id TEXT PRIMARY KEY,
+            version TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            chunk_count INTEGER NOT NULL
+          )`,
+        )
+        .run(),
+      db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS nextchat_sync_chunks (
+            user_id TEXT NOT NULL,
+            version TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            data TEXT NOT NULL,
+            PRIMARY KEY (user_id, version, chunk_index)
+          )`,
+        )
+        .run(),
+    ])
+      .then(() => undefined)
+      .catch((error) => {
+        schemaReadyPromise = null;
+        throw error;
+      });
+  }
 
-  await db
-    .prepare(
-      `CREATE TABLE IF NOT EXISTS nextchat_sync_chunks (
-        user_id TEXT NOT NULL,
-        version TEXT NOT NULL,
-        chunk_index INTEGER NOT NULL,
-        data TEXT NOT NULL,
-        PRIMARY KEY (user_id, version, chunk_index)
-      )`,
-    )
-    .run();
+  return schemaReadyPromise;
 }
 
-function jsonResponse(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), {
+function errorResponse(message: string, status: number) {
+  return new Response(JSON.stringify({ error: message }), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
@@ -80,13 +95,24 @@ function jsonResponse(body: unknown, status = 200) {
   });
 }
 
+function stateResponse(serialized: string, updatedAt: number) {
+  // The payload is already serialized JSON. Returning it directly avoids the
+  // expensive D1 string -> JSON.parse -> JS object -> JSON.stringify cycle in
+  // the Worker, which is especially costly for long code-heavy chats.
+  return new Response(serialized, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-NextChat-Updated-At": String(updatedAt || 0),
+    },
+  });
+}
+
 export async function GET(request: Request) {
   const userId = getUserId(request);
   if (!userId) {
-    return jsonResponse(
-      { error: "Cloudflare Access identity not found" },
-      401,
-    );
+    return errorResponse("Cloudflare Access identity not found", 401);
   }
 
   try {
@@ -103,7 +129,13 @@ export async function GET(request: Request) {
       .first();
 
     if (!meta) {
-      return jsonResponse({ state: null, updatedAt: 0 });
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Cache-Control": "no-store",
+          "X-NextChat-Updated-At": "0",
+        },
+      });
     }
 
     const rows = await db
@@ -118,20 +150,15 @@ export async function GET(request: Request) {
 
     const chunks = rows?.results ?? [];
     if (chunks.length !== Number(meta.chunk_count)) {
-      return jsonResponse({ error: "D1 sync state is incomplete" }, 409);
+      return errorResponse("D1 sync state is incomplete", 409);
     }
 
-    const serialized = chunks.map((row: any) => row.data).join("");
-    const state = serialized ? JSON.parse(serialized) : null;
-
-    return jsonResponse({
-      state,
-      updatedAt: Number(meta.updated_at) || 0,
-    });
+    const serialized = chunks.map((row: any) => String(row.data ?? "")).join("");
+    return stateResponse(serialized, Number(meta.updated_at) || 0);
   } catch (error) {
     console.error("[D1 Sync] GET failed", error);
-    return jsonResponse(
-      { error: error instanceof Error ? error.message : String(error) },
+    return errorResponse(
+      error instanceof Error ? error.message : String(error),
       500,
     );
   }
@@ -140,25 +167,21 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const userId = getUserId(request);
   if (!userId) {
-    return jsonResponse(
-      { error: "Cloudflare Access identity not found" },
-      401,
-    );
+    return errorResponse("Cloudflare Access identity not found", 401);
   }
 
   try {
-    const body = await request.json();
-    if (!body || typeof body !== "object" || !("state" in body)) {
-      return jsonResponse({ error: "Missing sync state" }, 400);
+    // The browser sends the Chat Store as an already serialized JSON string.
+    // Keep it opaque in the Worker: do not request.json() and do not stringify
+    // it again. This moves the large JSON parsing cost to the browser.
+    const serialized = await request.text();
+    if (!serialized) {
+      return errorResponse("Missing sync state", 400);
     }
 
-    const serialized = JSON.stringify(body.state);
     if (serialized.length > MAX_STATE_CHARS) {
-      return jsonResponse(
-        {
-          error:
-            "Chat sync state is too large for automatic D1 sync (16M characters limit)",
-        },
+      return errorResponse(
+        "Chat sync state is too large for automatic D1 sync (16M characters limit)",
         413,
       );
     }
@@ -212,15 +235,18 @@ export async function POST(request: Request) {
       .bind(userId, version)
       .run();
 
-    return jsonResponse({
-      ok: true,
-      updatedAt,
-      chunks: chunks.length,
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Cache-Control": "no-store",
+        "X-NextChat-Updated-At": String(updatedAt),
+        "X-NextChat-Chunks": String(chunks.length),
+      },
     });
   } catch (error) {
     console.error("[D1 Sync] POST failed", error);
-    return jsonResponse(
-      { error: error instanceof Error ? error.message : String(error) },
+    return errorResponse(
+      error instanceof Error ? error.message : String(error),
       500,
     );
   }
