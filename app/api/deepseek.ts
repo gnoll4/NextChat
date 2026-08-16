@@ -67,10 +67,14 @@ async function request(req: NextRequest) {
   const incomingAuthorization = req.headers.get("Authorization") ?? "";
   const incomingApiKey = req.headers.get("x-api-key") ?? "";
   const serverApiKey = serverConfig.deepseekApiKey ?? "";
+
+  // Server secret is authoritative when configured. In deployments with
+  // HIDE_USER_API_KEY/CODE, the browser Authorization header may contain the
+  // app access code rather than a DeepSeek API key.
   const resolvedApiKey =
+    serverApiKey ||
     incomingApiKey ||
-    incomingAuthorization.replace(/^Bearer\s+/i, "").trim() ||
-    serverApiKey;
+    incomingAuthorization.replace(/^Bearer\s+/i, "").trim();
   const isAnthropicRequest = path.startsWith("/anthropic/");
 
   const headers: Record<string, string> = {
