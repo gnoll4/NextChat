@@ -28,6 +28,20 @@ import { fetch } from "@/app/utils/stream";
 const DEEPSEEK_INPUT_TOKEN_BUDGET = 850_000;
 const DEEPSEEK_NON_STREAM_TIMEOUT_MS = 30 * 60 * 1000;
 
+type DeepSeekRequestPayload = Omit<
+  RequestPayload,
+  "temperature" | "presence_penalty" | "frequency_penalty" | "top_p"
+> &
+  Partial<
+    Pick<
+      RequestPayload,
+      "temperature" | "presence_penalty" | "frequency_penalty" | "top_p"
+    >
+  > & {
+    thinking?: { type: "enabled" | "disabled" };
+    reasoning_effort?: "high" | "max";
+  };
+
 function normalizeDeepSeekModel(model: string) {
   if (model === "deepseek-chat" || model === "deepseek-reasoner") {
     return "deepseek-v4-flash";
@@ -198,10 +212,7 @@ export class DeepSeekApi implements LLMApi {
     };
 
     const thinkingLevel = modelConfig.deepseekThinking ?? "high";
-    const requestPayload: RequestPayload & {
-      thinking?: { type: "enabled" | "disabled" };
-      reasoning_effort?: "high" | "max";
-    } = {
+    const requestPayload: DeepSeekRequestPayload = {
       messages: filteredMessages,
       stream: options.config.stream,
       model: modelConfig.model,
@@ -281,7 +292,7 @@ export class DeepSeekApi implements LLMApi {
             return { isThinking: false, content: "" };
           },
           (
-            payload: RequestPayload,
+            payload: DeepSeekRequestPayload,
             toolCallMessage: any,
             toolCallResult: any[],
           ) => {
