@@ -19,6 +19,7 @@ import {
 } from "../api";
 import { getClientConfig } from "@/app/config/client";
 import {
+  getMessageImages,
   getMessageTextContent,
   getMessageTextContentWithoutThinking,
 } from "@/app/utils";
@@ -29,6 +30,8 @@ const DEEPSEEK_DEFAULT_INPUT_TOKEN_BUDGET = 256_000;
 const DEEPSEEK_NON_STREAM_TIMEOUT_MS = 30 * 60 * 1000;
 const DEEPSEEK_NATIVE_SEARCH_MAX_USES = 3;
 const DEEPSEEK_ANTHROPIC_MAX_OUTPUT_TOKENS = 65_536;
+const DEEPSEEK_IMAGE_UNSUPPORTED_NOTICE =
+  "[系统提示：这条用户消息包含图片，但当前 DeepSeek V4 是纯文本模型，无法读取图片内容。不要猜测或声称看到了图片；如果回答依赖图片，请明确告诉用户需要切换到支持视觉输入的模型。]";
 
 const DEEPSEEK_NATIVE_WEB_SEARCH_TOOL = {
   type: "web_search_20250305",
@@ -84,6 +87,22 @@ function isErrorMessage(message: any) {
   return !!message?.isError;
 }
 
+function getDeepSeekTextContent(message: any, stripThinking = false) {
+  const text = stripThinking
+    ? getMessageTextContentWithoutThinking(message)
+    : getMessageTextContent(message);
+  const hasImages = getMessageImages(message).some(Boolean);
+
+  if (!hasImages) return text;
+
+  const trimmedText = text.trim();
+  if (!trimmedText) {
+    return DEEPSEEK_IMAGE_UNSUPPORTED_NOTICE;
+  }
+
+  return `${trimmedText}\n\n${DEEPSEEK_IMAGE_UNSUPPORTED_NOTICE}`;
+}
+
 function cleanPersistedMessages(messages: any[]) {
   return messages.filter((message, index, allMessages) => {
     if (!message || isErrorMessage(message)) return false;
@@ -109,7 +128,7 @@ function trimMessagesToTokenBudget(messages: any[], tokenBudget: number) {
     const message = messages[i];
     if (!message || isErrorMessage(message)) continue;
 
-    const tokenCount = estimateTokenLength(getMessageTextContent(message));
+    const tokenCount = estimateTokenLength(getDeepSeekTextContent(message));
 
     if (selected.length > 0 && usedTokens + tokenCount > tokenBudget) {
       break;
@@ -269,7 +288,7 @@ export class DeepSeekApi implements LLMApi {
 
       const supplementalTokenCount = supplementalMessages.reduce(
         (total, message) =>
-          total + estimateTokenLength(getMessageTextContent(message)),
+          total + estimateTokenLength(getDeepSeekTextContent(message)),
         0,
       );
 
@@ -294,13 +313,10 @@ export class DeepSeekApi implements LLMApi {
     for (const v of sourceMessages) {
       if (isErrorMessage(v)) continue;
 
-      if (v.role === "assistant") {
-        const content = getMessageTextContentWithoutThinking(v);
-        messages.push({ role: v.role, content });
-      } else {
-        const content = getMessageTextContent(v);
-        messages.push({ role: v.role, content });
-      }
+      const content = getDeepSeekTextContent(v, v.role === "assistant");
+      if (!content.trim()) continue;
+
+      messages.push({ role: v.role, content });
     }
 
     const filteredMessages: ChatOptions["messages"] = [];
