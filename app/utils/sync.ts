@@ -103,10 +103,12 @@ const MergeStates: StateMerger = {
       }
     });
 
-    // Drop the initial empty placeholder when real synced chats exist.
+    // A brand-new browser starts with one local empty placeholder session.
+    // Once real local/remote chats exist, remove empty placeholders so the
+    // newest actual synced conversation is selected immediately.
     if (localState.sessions.some((s) => s.messages.length > 0)) {
       localState.sessions = localState.sessions.filter(
-        (s) => s.messages.length > 0 || s.topic !== "New Chat",
+        (s) => s.messages.length > 0,
       );
     }
 
