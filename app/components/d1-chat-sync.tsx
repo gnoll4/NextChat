@@ -10,13 +10,8 @@ import {
 } from "../utils/sync";
 
 const SYNC_API = "/api/sync/d1";
-const PUSH_DEBOUNCE_MS = 5000;
-const FOCUS_PULL_MIN_INTERVAL_MS = 15000;
-
-type RemoteSyncResponse = {
-  state: ChatSyncState | null;
-  updatedAt: number;
-};
+const PUSH_DEBOUNCE_MS = 20_000;
+const FOCUS_PULL_MIN_INTERVAL_MS = 60_000;
 
 async function waitForChatHydration() {
   if (useChatStore.getState()._hasHydrated) return;
@@ -52,13 +47,16 @@ export function D1ChatSync() {
 
       pushInFlight = true;
       try {
-        const state = getLocalChatState();
+        // Serialize in the browser and send the JSON string directly. The
+        // Worker stores this payload as opaque text, avoiding large JSON parse
+        // and stringify work on Cloudflare's CPU budget.
+        const serialized = JSON.stringify(getLocalChatState());
         const response = await fetch(SYNC_API, {
           method: "POST",
           headers: {
-            "Content-Type": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
           },
-          body: JSON.stringify({ state }),
+          body: serialized,
           cache: "no-store",
         });
 
@@ -72,7 +70,7 @@ export function D1ChatSync() {
         pushInFlight = false;
         if (pushAgain && !disposed) {
           pushAgain = false;
-          void push();
+          schedulePush();
         }
       }
     };
@@ -80,7 +78,10 @@ export function D1ChatSync() {
     const schedulePush = () => {
       if (!ready || applyingRemote || disposed) return;
       if (pushTimer) clearTimeout(pushTimer);
-      pushTimer = setTimeout(() => void push(), PUSH_DEBOUNCE_MS);
+      pushTimer = setTimeout(() => {
+        pushTimer = undefined;
+        void push();
+      }, PUSH_DEBOUNCE_MS);
     };
 
     const pull = async () => {
@@ -101,19 +102,27 @@ export function D1ChatSync() {
           return false;
         }
 
+        // 204 means this Access user has no remote snapshot yet.
+        if (response.status === 204) {
+          return true;
+        }
+
         if (!response.ok) {
           const text = await response.text();
           console.warn("[D1 Sync] download failed", response.status, text);
           return false;
         }
 
-        const remote = (await response.json()) as RemoteSyncResponse;
-        if (!remote.state || disposed) return true;
+        const serialized = await response.text();
+        if (!serialized || disposed) return true;
+
+        const remote = JSON.parse(serialized) as ChatSyncState;
+        if (!remote?.sessions) return true;
 
         applyingRemote = true;
         try {
           const local = getLocalChatState();
-          const merged = mergeChatState(local, remote.state);
+          const merged = mergeChatState(local, remote);
           setLocalChatState(merged);
         } finally {
           applyingRemote = false;
@@ -139,9 +148,9 @@ export function D1ChatSync() {
       if (document.visibilityState === "visible") {
         onFocus();
       } else if (ready) {
-        // Best effort: start an upload when leaving the tab. Normal changes are
-        // already debounced, so this mainly shortens the unsynced window.
-        void push();
+        // Do not force an immediate full-state upload when the tab is hidden.
+        // Keep the normal debounce so rapid tab switching cannot hammer D1.
+        schedulePush();
       }
     };
 
@@ -155,17 +164,16 @@ export function D1ChatSync() {
       ready = reachable;
       if (!ready) return;
 
-      // Persist the merged state back to D1 so the server becomes the common
-      // snapshot for the next browser/device.
-      await push();
-      if (disposed) return;
-
       unsubscribe = useChatStore.subscribe(() => {
         schedulePush();
       });
 
       window.addEventListener("focus", onFocus);
       document.addEventListener("visibilitychange", onVisibilityChange);
+
+      // If this browser has local chats that are not yet in D1, upload the
+      // merged snapshot later instead of immediately during page startup.
+      schedulePush();
 
       console.log("[D1 Sync] automatic chat sync enabled");
     };
