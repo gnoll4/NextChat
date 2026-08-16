@@ -20,6 +20,8 @@ export function ModelConfigList(props: {
   );
   const value = `${props.modelConfig.model}@${props.modelConfig?.providerName}`;
   const compressModelValue = `${props.modelConfig.compressModel}@${props.modelConfig?.compressProviderName}`;
+  const isDeepSeek =
+    props.modelConfig?.providerName === ServiceProvider.DeepSeek;
 
   return (
     <>
@@ -49,6 +51,55 @@ export function ModelConfigList(props: {
           ))}
         </Select>
       </ListItem>
+
+      {isDeepSeek && (
+        <>
+          <ListItem
+            title="DeepSeek 思考深度"
+            subTitle="关闭最省 Token；复杂代码分析再使用 High/Max"
+          >
+            <Select
+              aria-label="DeepSeek 思考深度"
+              value={props.modelConfig.deepseekThinking ?? "off"}
+              align="left"
+              onChange={(e) =>
+                props.updateConfig((config) => {
+                  config.deepseekThinking = e.currentTarget
+                    .value as ModelConfig["deepseekThinking"];
+                })
+              }
+            >
+              <option value="off">关闭</option>
+              <option value="high">High</option>
+              <option value="max">Max</option>
+            </Select>
+          </ListItem>
+
+          <ListItem
+            title="DeepSeek 上下文预算"
+            subTitle="越大越能保留长代码历史，但每轮输入 Token 可能更多"
+          >
+            <Select
+              aria-label="DeepSeek 上下文预算"
+              value={String(props.modelConfig.deepseekContextTokens ?? 256000)}
+              align="left"
+              onChange={(e) =>
+                props.updateConfig((config) => {
+                  config.deepseekContextTokens = Number(
+                    e.currentTarget.value,
+                  ) as ModelConfig["deepseekContextTokens"];
+                })
+              }
+            >
+              <option value="128000">128K（省 Token）</option>
+              <option value="256000">256K（推荐）</option>
+              <option value="512000">512K</option>
+              <option value="850000">850K（超长代码）</option>
+            </Select>
+          </ListItem>
+        </>
+      )}
+
       <ListItem
         title={Locale.Settings.Temperature.Title}
         subTitle={Locale.Settings.Temperature.SubTitle}
