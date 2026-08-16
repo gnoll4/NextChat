@@ -1,12 +1,15 @@
 "use client";
-// azure and openai, using same models. so using same LLMApi.
+
 import { ApiPath, DEEPSEEK_BASE_URL, DeepSeek } from "@/app/constant";
 import {
+  ChatMessageTool,
   useAccessStore,
   useAppConfig,
   useChatStore,
+  usePluginStore,
 } from "@/app/store";
 import { streamWithThink } from "@/app/utils/chat";
+import { estimateTokenLength } from "@/app/utils/token";
 import {
   ChatOptions,
   getHeaders,
@@ -18,16 +21,69 @@ import { getClientConfig } from "@/app/config/client";
 import {
   getMessageTextContent,
   getMessageTextContentWithoutThinking,
-  getTimeoutMSByModel,
 } from "@/app/utils";
+import { RequestPayload } from "./openai";
 import { fetch } from "@/app/utils/stream";
+
+const DEEPSEEK_INPUT_TOKEN_BUDGET = 850_000;
+const DEEPSEEK_NON_STREAM_TIMEOUT_MS = 30 * 60 * 1000;
+
+function normalizeDeepSeekModel(model: string) {
+  if (model === "deepseek-chat" || model === "deepseek-reasoner") {
+    return "deepseek-v4-flash";
+  }
+  return model;
+}
+
+function isErrorMessage(message: any) {
+  return !!message?.isError;
+}
+
+function cleanPersistedMessages(messages: any[]) {
+  return messages.filter((message, index, allMessages) => {
+    if (!message || isErrorMessage(message)) return false;
+
+    const next = allMessages[index + 1];
+    if (
+      message.role === "user" &&
+      next?.role === "assistant" &&
+      isErrorMessage(next)
+    ) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
+function trimMessagesToTokenBudget(messages: any[], tokenBudget: number) {
+  const selected: any[] = [];
+  let usedTokens = 0;
+
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (!message || isErrorMessage(message)) continue;
+
+    const tokenCount = estimateTokenLength(getMessageTextContent(message));
+
+    if (selected.length > 0 && usedTokens + tokenCount > tokenBudget) {
+      break;
+    }
+
+    selected.push(message);
+    usedTokens += tokenCount;
+
+    if (usedTokens >= tokenBudget) break;
+  }
+
+  return selected.reverse();
+}
 
 export class DeepSeekApi implements LLMApi {
   private disableListModels = true;
 
   path(path: string): string {
     const accessStore = useAccessStore.getState();
-
     let baseUrl = "";
 
     if (accessStore.useCustomConfig) {
@@ -48,7 +104,6 @@ export class DeepSeekApi implements LLMApi {
     }
 
     console.log("[Proxy Endpoint] ", baseUrl, path);
-
     return [baseUrl, path].join("/");
   }
 
@@ -61,9 +116,57 @@ export class DeepSeekApi implements LLMApi {
   }
 
   async chat(options: ChatOptions) {
+    const chatStore = useChatStore.getState();
+    const currentSession = chatStore.currentSession();
+    const persistedMessages = currentSession.messages ?? [];
+    const lastPersistedMessage = persistedMessages.at(-1) as any;
+
+    const isInteractiveTurn =
+      lastPersistedMessage?.role === "assistant" &&
+      lastPersistedMessage?.streaming === true;
+
+    let sourceMessages: any[] = options.messages as any[];
+
+    if (isInteractiveTurn) {
+      const persistedIds = new Set(
+        persistedMessages.map((message: any) => message?.id).filter(Boolean),
+      );
+
+      const supplementalMessages = (options.messages as any[]).filter(
+        (message: any) => !message?.id || !persistedIds.has(message.id),
+      );
+
+      const cleanMessages = cleanPersistedMessages(
+        persistedMessages.slice(0, -1),
+      );
+
+      const supplementalTokenCount = supplementalMessages.reduce(
+        (total, message) =>
+          total + estimateTokenLength(getMessageTextContent(message)),
+        0,
+      );
+
+      const historyBudget = Math.max(
+        32_000,
+        DEEPSEEK_INPUT_TOKEN_BUDGET - supplementalTokenCount,
+      );
+
+      sourceMessages = [
+        ...supplementalMessages,
+        ...trimMessagesToTokenBudget(cleanMessages, historyBudget),
+      ];
+
+      console.log("[DeepSeek Context]", {
+        persistedMessages: persistedMessages.length,
+        selectedMessages: sourceMessages.length,
+        inputTokenBudget: DEEPSEEK_INPUT_TOKEN_BUDGET,
+      });
+    }
+
     const messages: ChatOptions["messages"] = [];
-  
-    for (const v of options.messages) {
+    for (const v of sourceMessages) {
+      if (isErrorMessage(v)) continue;
+
       if (v.role === "assistant") {
         const content = getMessageTextContentWithoutThinking(v);
         messages.push({ role: v.role, content });
@@ -72,11 +175,10 @@ export class DeepSeekApi implements LLMApi {
         messages.push({ role: v.role, content });
       }
     }
-  
-    // 确保第一个非 system 消息为 user
+
     const filteredMessages: ChatOptions["messages"] = [];
     let hasFoundFirstUser = false;
-  
+
     for (const msg of messages) {
       if (msg.role === "system") {
         filteredMessages.push(msg);
@@ -87,212 +189,145 @@ export class DeepSeekApi implements LLMApi {
         filteredMessages.push(msg);
       }
     }
-  
+
     const modelConfig = {
       ...useAppConfig.getState().modelConfig,
-      ...useChatStore.getState().currentSession().mask.modelConfig,
-      model: options.config.model,
+      ...currentSession.mask.modelConfig,
+      model: normalizeDeepSeekModel(options.config.model),
       providerName: options.config.providerName,
     };
-  
-    const thinkingLevel =
-      modelConfig.deepseekThinking ?? "high";
-  
-    const reasoningEffort =
-      thinkingLevel === "off"
-        ? "none"
-        : thinkingLevel;
-  
-    /*
-     * DeepSeek Responses API
-     *
-     * off  -> none
-     * low  -> low
-     * high -> high
-     * max  -> max
-     */
-    const requestPayload: any = {
+
+    const thinkingLevel = modelConfig.deepseekThinking ?? "high";
+    const requestPayload: RequestPayload & {
+      thinking?: { type: "enabled" | "disabled" };
+      reasoning_effort?: "high" | "max";
+    } = {
+      messages: filteredMessages,
+      stream: options.config.stream,
       model: modelConfig.model,
-  
-      input: filteredMessages.map((msg) => ({
-        role: msg.role,
-        content: msg.content,
-      })),
-  
-      stream: !!options.config.stream,
-  
-      reasoning: {
-        effort: reasoningEffort,
-      },
     };
-  
-    // 非思考模式下这些参数才真正有效
+
     if (thinkingLevel === "off") {
-      requestPayload.temperature =
-        modelConfig.temperature;
-  
-      requestPayload.top_p =
-        modelConfig.top_p;
+      requestPayload.thinking = { type: "disabled" };
+      requestPayload.temperature = modelConfig.temperature;
+      requestPayload.presence_penalty = modelConfig.presence_penalty;
+      requestPayload.frequency_penalty = modelConfig.frequency_penalty;
+      requestPayload.top_p = modelConfig.top_p;
+    } else {
+      requestPayload.thinking = { type: "enabled" };
+      requestPayload.reasoning_effort = thinkingLevel === "max" ? "max" : "high";
     }
-  
-    console.log(
-      "[DeepSeek Responses Request]",
-      requestPayload,
-    );
-  
+
+    console.log("[DeepSeek ChatCompletions Request]", {
+      model: requestPayload.model,
+      messageCount: requestPayload.messages?.length ?? 0,
+      thinking: requestPayload.thinking,
+      reasoningEffort: requestPayload.reasoning_effort,
+    });
+
+    const shouldStream = !!options.config.stream;
     const controller = new AbortController();
     options.onController?.(controller);
-  
-    /*
-     * DeepSeek 官方原生 Web Search
-     *
-     * tool_choice 默认 auto：
-     * 由模型判断是否需要联网。
-     */
-    const nativeTools = [
-      {
-        type: "web_search",
-      },
-    ];
-  
+
     try {
-      const responsePath =
-        this.path(DeepSeek.ResponsesPath);
-  
-      /*
-       * 流式
-       */
-      if (options.config.stream) {
+      const chatPath = this.path(DeepSeek.ChatPath);
+
+      if (shouldStream) {
+        const [tools, funcs] = usePluginStore
+          .getState()
+          .getAsTools(currentSession.mask?.plugin || []);
+
         return streamWithThink(
-          responsePath,
-  
+          chatPath,
           requestPayload,
-  
           getHeaders(),
-  
-          nativeTools,
-  
-          {},
-  
+          tools as any,
+          funcs,
           controller,
-  
-          /*
-           * DeepSeek Responses API SSE Parser
-           */
-          (text: string) => {
+          (text: string, runTools: ChatMessageTool[]) => {
             const json = JSON.parse(text);
-  
-            /*
-             * 思考内容
-             */
-            if (
-              json.type ===
-              "response.reasoning_text.delta"
-            ) {
-              return {
-                isThinking: true,
-                content: json.delta ?? "",
-              };
+            const choice = json.choices?.[0];
+            const delta = choice?.delta ?? {};
+            const toolCalls = delta.tool_calls as ChatMessageTool[] | undefined;
+
+            if (toolCalls?.length) {
+              for (const toolCall of toolCalls as any[]) {
+                const index = toolCall?.index ?? 0;
+                const id = toolCall?.id;
+                const args = toolCall?.function?.arguments ?? "";
+
+                if (id) {
+                  runTools[index] = {
+                    id,
+                    index,
+                    type: toolCall?.type,
+                    function: {
+                      name: toolCall?.function?.name as string,
+                      arguments: args,
+                    },
+                  };
+                } else if (runTools[index]?.function) {
+                  runTools[index].function!.arguments =
+                    (runTools[index].function!.arguments ?? "") + args;
+                }
+              }
             }
-  
-            /*
-             * 最终回答
-             */
-            if (
-              json.type ===
-              "response.output_text.delta"
-            ) {
-              return {
-                isThinking: false,
-                content: json.delta ?? "",
-              };
-            }
-  
-            /*
-             * 以下事件忽略：
-             *
-             * response.created
-             * response.web_search_call.*
-             * response.output_item.*
-             * response.completed
-             */
-            return {
-              isThinking: false,
-              content: "",
-            };
+
+            const reasoning = delta.reasoning_content as string | null;
+            const content = delta.content as string | null;
+
+            if (reasoning) return { isThinking: true, content: reasoning };
+            if (content) return { isThinking: false, content };
+            return { isThinking: false, content: "" };
           },
-  
-          /*
-           * 原生 web_search 在 DeepSeek 服务端执行，
-           * 不需要 NextChat 本地执行 Tool。
-           */
-          () => {},
-  
+          (
+            payload: RequestPayload,
+            toolCallMessage: any,
+            toolCallResult: any[],
+          ) => {
+            payload.messages?.splice(
+              payload.messages.length,
+              0,
+              toolCallMessage,
+              ...toolCallResult,
+            );
+          },
           options,
         );
       }
-  
-      /*
-       * 非流式
-       */
-      const res = await fetch(responsePath, {
-        method: "POST",
-  
-        body: JSON.stringify({
-          ...requestPayload,
-          tools: nativeTools,
-        }),
-  
-        signal: controller.signal,
-  
-        headers: getHeaders(),
-      });
-  
-      if (!res.ok) {
-        const errorText = await res.text();
-  
-        throw new Error(
-          `DeepSeek API Error ${res.status}: ${errorText}`,
-        );
-      }
-  
-      const data = await res.json();
-  
-      const outputText =
-        data.output
-          ?.filter(
-            (item: any) =>
-              item.type === "message",
-          )
-          ?.flatMap(
-            (item: any) =>
-              item.content ?? [],
-          )
-          ?.filter(
-            (item: any) =>
-              item.type === "output_text",
-          )
-          ?.map(
-            (item: any) =>
-              item.text ?? "",
-          )
-          ?.join("") ?? "";
-  
-      options.onFinish(outputText, res);
-    } catch (e) {
-      console.error(
-        "[DeepSeek Responses API Error]",
-        e,
+
+      const requestTimeoutId = setTimeout(
+        () => controller.abort(),
+        DEEPSEEK_NON_STREAM_TIMEOUT_MS,
       );
-  
+
+      try {
+        const res = await fetch(chatPath, {
+          method: "POST",
+          body: JSON.stringify(requestPayload),
+          signal: controller.signal,
+          headers: getHeaders(),
+        });
+
+        if (!res.ok) {
+          const errorText = await res.text();
+          throw new Error(`DeepSeek API Error ${res.status}: ${errorText}`);
+        }
+
+        const resJson = await res.json();
+        const message = this.extractMessage(resJson);
+        options.onFinish(message, res);
+      } finally {
+        clearTimeout(requestTimeoutId);
+      }
+    } catch (e) {
+      console.error("[DeepSeek ChatCompletions API Error]", e);
       options.onError?.(e as Error);
     }
   }
+
   async usage() {
-    return {
-      used: 0,
-      total: 0,
-    };
+    return { used: 0, total: 0 };
   }
 
   async models(): Promise<LLMModel[]> {
