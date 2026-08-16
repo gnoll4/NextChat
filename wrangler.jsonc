@@ -14,6 +14,14 @@
     "HIDE_USER_API_KEY": "1"
   },
 
+  "d1_databases": [
+    {
+      "binding": "NEXTCHAT_DB",
+      "database_name": "netxtchat",
+      "database_id": "b8f23859-d06e-4a85-979b-32e2902a6ff8"
+    }
+  ],
+
   "assets": {
     "directory": ".open-next/assets",
     "binding": "ASSETS"
