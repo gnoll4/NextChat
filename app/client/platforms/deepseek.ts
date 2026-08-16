@@ -147,16 +147,22 @@ export class DeepSeekApi implements LLMApi {
     const globalModelConfig = useAppConfig.getState().modelConfig;
     const sessionModelConfig = currentSession.mask.modelConfig;
 
+    // The config carried by this request is the most authoritative value.
+    // It comes from the current session in onUserInput(). This prevents an
+    // older global default (for example "off") from silently overriding a
+    // High/Max selection made for the current conversation.
     const modelConfig = {
       ...globalModelConfig,
       ...sessionModelConfig,
       deepseekThinking:
-        globalModelConfig.deepseekThinking ??
+        options.config.deepseekThinking ??
         sessionModelConfig.deepseekThinking ??
+        globalModelConfig.deepseekThinking ??
         "off",
       deepseekContextTokens:
-        globalModelConfig.deepseekContextTokens ??
+        options.config.deepseekContextTokens ??
         sessionModelConfig.deepseekContextTokens ??
+        globalModelConfig.deepseekContextTokens ??
         DEEPSEEK_DEFAULT_INPUT_TOKEN_BUDGET,
       model: normalizeDeepSeekModel(options.config.model),
       providerName: options.config.providerName,
@@ -260,6 +266,7 @@ export class DeepSeekApi implements LLMApi {
       model: requestPayload.model,
       messageCount: requestPayload.messages?.length ?? 0,
       contextTokenBudget,
+      selectedThinkingLevel: thinkingLevel,
       thinking: requestPayload.thinking,
       reasoningEffort: requestPayload.reasoning_effort,
     });
@@ -286,7 +293,6 @@ export class DeepSeekApi implements LLMApi {
           (text: string, runTools: ChatMessageTool[]) => {
             const json = JSON.parse(text);
 
-            // Compatibility with DeepSeek Responses-style SSE events.
             if (json.type === "response.reasoning_text.delta") {
               return {
                 isThinking: true,
@@ -300,7 +306,6 @@ export class DeepSeekApi implements LLMApi {
               };
             }
 
-            // Official Chat Completions streaming format.
             const choice = json.choices?.[0];
             const delta = choice?.delta ?? {};
             const toolCalls = delta.tool_calls as ChatMessageTool[] | undefined;
@@ -328,8 +333,6 @@ export class DeepSeekApi implements LLMApi {
               }
             }
 
-            // reasoning_content is the official field. The additional fallbacks
-            // make the UI tolerant of compatible gateways/proxies.
             const reasoning =
               delta.reasoning_content ??
               delta.reasoning ??
