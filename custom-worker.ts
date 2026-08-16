@@ -119,6 +119,7 @@ async function proxyDeepSeek(request: Request, env: any) {
     responseHeaders.delete("www-authenticate");
     responseHeaders.set("X-Accel-Buffering", "no");
     responseHeaders.set("Cache-Control", "no-store");
+    responseHeaders.set("X-NextChat-DeepSeek-Proxy", "raw");
 
     // Stream DeepSeek SSE/body back unchanged. No buffering or parsing in the
     // Worker, so request CPU cost stays nearly independent of history length.
