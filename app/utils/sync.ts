@@ -52,6 +52,8 @@ export type AppState = {
   >;
 };
 
+export type ChatSyncState = AppState[StoreKey.Chat];
+
 type Merger<T extends keyof AppState, U = AppState[T]> = (
   localState: U,
   remoteState: U,
@@ -89,14 +91,28 @@ const MergeStates: StateMerger = {
         localSession.messages.sort(
           (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime(),
         );
+
+        if (remoteSession.lastUpdate > localSession.lastUpdate) {
+          localSession.topic = remoteSession.topic;
+          localSession.lastUpdate = remoteSession.lastUpdate;
+          localSession.memoryPrompt = remoteSession.memoryPrompt;
+          localSession.lastSummarizeIndex = remoteSession.lastSummarizeIndex;
+          localSession.clearContextIndex = remoteSession.clearContextIndex;
+          localSession.mask = remoteSession.mask;
+        }
       }
     });
 
+    // Drop the initial empty placeholder when real synced chats exist.
+    if (localState.sessions.some((s) => s.messages.length > 0)) {
+      localState.sessions = localState.sessions.filter(
+        (s) => s.messages.length > 0 || s.topic !== "New Chat",
+      );
+    }
+
     // sort local sessions with date field in desc order
-    localState.sessions.sort(
-      (a, b) =>
-        new Date(b.lastUpdate).getTime() - new Date(a.lastUpdate).getTime(),
-    );
+    localState.sessions.sort((a, b) => b.lastUpdate - a.lastUpdate);
+    localState.currentSessionIndex = 0;
 
     return localState;
   },
@@ -143,6 +159,23 @@ export function mergeAppState(localState: AppState, remoteState: AppState) {
   });
 
   return localState;
+}
+
+// D1 cross-device sync intentionally uses Chat Store only. This keeps API keys,
+// access codes and provider credentials out of the remote database.
+export function getLocalChatState(): ChatSyncState {
+  return getNonFunctionFileds(useChatStore.getState());
+}
+
+export function mergeChatState(
+  localState: ChatSyncState,
+  remoteState: ChatSyncState,
+): ChatSyncState {
+  return MergeStates[StoreKey.Chat](localState, remoteState);
+}
+
+export function setLocalChatState(chatState: ChatSyncState) {
+  useChatStore.setState(chatState);
 }
 
 /**
