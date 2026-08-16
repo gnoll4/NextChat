@@ -41,7 +41,6 @@ export async function handle(
 async function request(req: NextRequest) {
   const controller = new AbortController();
 
-  // alibaba use base url or just remove the path
   let path = `${req.nextUrl.pathname}`.replaceAll(ApiPath.DeepSeek, "");
 
   let baseUrl = serverConfig.deepseekUrl || DEEPSEEK_BASE_URL;
@@ -65,11 +64,31 @@ async function request(req: NextRequest) {
   );
 
   const fetchUrl = `${baseUrl}${path}`;
+  const incomingAuthorization = req.headers.get("Authorization") ?? "";
+  const incomingApiKey = req.headers.get("x-api-key") ?? "";
+  const serverApiKey = serverConfig.deepseekApiKey ?? "";
+  const resolvedApiKey =
+    incomingApiKey ||
+    incomingAuthorization.replace(/^Bearer\s+/i, "").trim() ||
+    serverApiKey;
+  const isAnthropicRequest = path.startsWith("/anthropic/");
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  if (isAnthropicRequest) {
+    headers["x-api-key"] = resolvedApiKey;
+    headers["anthropic-version"] =
+      req.headers.get("anthropic-version") || "2023-06-01";
+  } else {
+    headers.Authorization = resolvedApiKey
+      ? `Bearer ${resolvedApiKey}`
+      : incomingAuthorization;
+  }
+
   const fetchOptions: RequestInit = {
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: req.headers.get("Authorization") ?? "",
-    },
+    headers,
     method: req.method,
     body: req.body,
     redirect: "manual",
@@ -78,7 +97,6 @@ async function request(req: NextRequest) {
     signal: controller.signal,
   };
 
-  // #1815 try to refuse some request to some models
   if (serverConfig.customModels && req.body) {
     try {
       const clonedBody = await req.text();
@@ -86,7 +104,6 @@ async function request(req: NextRequest) {
 
       const jsonBody = JSON.parse(clonedBody) as { model?: string };
 
-      // not undefined and is false
       if (
         isModelNotavailableInServer(
           serverConfig.customModels,
@@ -111,10 +128,8 @@ async function request(req: NextRequest) {
   try {
     const res = await fetch(fetchUrl, fetchOptions);
 
-    // to prevent browser prompt for credentials
     const newHeaders = new Headers(res.headers);
     newHeaders.delete("www-authenticate");
-    // to disable nginx buffering
     newHeaders.set("X-Accel-Buffering", "no");
 
     return new Response(res.body, {
