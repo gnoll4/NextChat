@@ -1,5 +1,5 @@
 import { ServiceProvider } from "@/app/constant";
-import { ModalConfigValidator, ModelConfig } from "../store";
+import { ModalConfigValidator, ModelConfig, useChatStore } from "../store";
 
 import Locale from "../locales";
 import { InputRange } from "./input-range";
@@ -14,6 +14,7 @@ export function ModelConfigList(props: {
   updateConfig: (updater: (config: ModelConfig) => void) => void;
 }) {
   const allModels = useAllModels();
+  const chatStore = useChatStore();
   const groupModels = groupBy(
     allModels.filter((v) => v.available),
     "provider.providerName",
@@ -22,6 +23,22 @@ export function ModelConfigList(props: {
   const compressModelValue = `${props.modelConfig.compressModel}@${props.modelConfig?.compressProviderName}`;
   const isDeepSeek =
     props.modelConfig?.providerName === ServiceProvider.DeepSeek;
+
+  const syncCurrentDeepSeekConfig = (
+    patch: Partial<
+      Pick<ModelConfig, "deepseekThinking" | "deepseekContextTokens">
+    >,
+  ) => {
+    const session = chatStore.currentSession();
+    if (!session) return;
+
+    chatStore.updateTargetSession(session, (targetSession) => {
+      targetSession.mask.modelConfig = {
+        ...targetSession.mask.modelConfig,
+        ...patch,
+      };
+    });
+  };
 
   return (
     <>
@@ -62,12 +79,14 @@ export function ModelConfigList(props: {
               aria-label="DeepSeek 思考深度"
               value={props.modelConfig.deepseekThinking ?? "off"}
               align="left"
-              onChange={(e) =>
+              onChange={(e) => {
+                const thinking = e.currentTarget
+                  .value as ModelConfig["deepseekThinking"];
                 props.updateConfig((config) => {
-                  config.deepseekThinking = e.currentTarget
-                    .value as ModelConfig["deepseekThinking"];
-                })
-              }
+                  config.deepseekThinking = thinking;
+                });
+                syncCurrentDeepSeekConfig({ deepseekThinking: thinking });
+              }}
             >
               <option value="off">关闭</option>
               <option value="high">High</option>
@@ -83,13 +102,17 @@ export function ModelConfigList(props: {
               aria-label="DeepSeek 上下文预算"
               value={String(props.modelConfig.deepseekContextTokens ?? 256000)}
               align="left"
-              onChange={(e) =>
+              onChange={(e) => {
+                const contextTokens = Number(
+                  e.currentTarget.value,
+                ) as ModelConfig["deepseekContextTokens"];
                 props.updateConfig((config) => {
-                  config.deepseekContextTokens = Number(
-                    e.currentTarget.value,
-                  ) as ModelConfig["deepseekContextTokens"];
-                })
-              }
+                  config.deepseekContextTokens = contextTokens;
+                });
+                syncCurrentDeepSeekConfig({
+                  deepseekContextTokens: contextTokens,
+                });
+              }}
             >
               <option value="128000">128K（省 Token）</option>
               <option value="256000">256K（推荐）</option>
