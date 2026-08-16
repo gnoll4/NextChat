@@ -3,13 +3,7 @@ import openNextWorker from "./.open-next/worker.js";
 
 const DEEPSEEK_PROXY_PREFIX = "/api/deepseek";
 const DEFAULT_DEEPSEEK_URL = "https://api.deepseek.com";
-
-function hasCloudflareAccessIdentity(request: Request) {
-  return Boolean(
-    request.headers.get("cf-access-authenticated-user-email") ||
-      request.headers.get("cf-access-jwt-assertion"),
-  );
-}
+const ACCESS_CODE_PREFIX = "nk-";
 
 function errorResponse(message: string, status = 500) {
   return new Response(JSON.stringify({ error: true, message }), {
@@ -21,7 +15,53 @@ function errorResponse(message: string, status = 500) {
   });
 }
 
+function parseBearer(request: Request) {
+  return (request.headers.get("Authorization") || "")
+    .replace(/^Bearer\s+/i, "")
+    .trim();
+}
+
+function authorizeDeepSeek(request: Request, env: any) {
+  const token = parseBearer(request);
+  const isAccessCode = token.startsWith(ACCESS_CODE_PREFIX);
+  const accessCode = isAccessCode ? token.slice(ACCESS_CODE_PREFIX.length) : "";
+  const isUserApiKey = Boolean(token) && !isAccessCode;
+  const configuredCodes = String(env.CODE || "")
+    .split(",")
+    .map((code) => code.trim())
+    .filter(Boolean);
+
+  // Match the existing NextChat auth behavior without importing the Next.js
+  // auth stack. When CODE is configured, a valid nk- access code is required.
+  if (configuredCodes.length > 0 && !configuredCodes.includes(accessCode)) {
+    return {
+      ok: false,
+      response: errorResponse(
+        accessCode ? "wrong access code" : "empty access code",
+        401,
+      ),
+    };
+  }
+
+  // Preserve HIDE_USER_API_KEY: do not let callers turn this endpoint into a
+  // proxy for arbitrary user-supplied DeepSeek keys.
+  if (env.HIDE_USER_API_KEY && isUserApiKey) {
+    return {
+      ok: false,
+      response: errorResponse(
+        "you are not allowed to access with your own api key",
+        401,
+      ),
+    };
+  }
+
+  return { ok: true as const };
+}
+
 async function proxyDeepSeek(request: Request, env: any) {
+  const auth = authorizeDeepSeek(request, env);
+  if (!auth.ok) return auth.response;
+
   const requestUrl = new URL(request.url);
   const upstreamPath =
     requestUrl.pathname.slice(DEEPSEEK_PROXY_PREFIX.length) || "/";
@@ -67,8 +107,8 @@ async function proxyDeepSeek(request: Request, env: any) {
   };
 
   if (request.method !== "GET" && request.method !== "HEAD") {
-    // Keep the large chat payload as a stream. Do not call text(), json(),
-    // arrayBuffer(), clone(), or JSON.parse() in the Worker.
+    // Critical for long conversations: keep the request body as a stream.
+    // Never call text(), json(), arrayBuffer(), clone() or JSON.parse() here.
     init.body = request.body;
     init.duplex = "half";
   }
@@ -80,7 +120,8 @@ async function proxyDeepSeek(request: Request, env: any) {
     responseHeaders.set("X-Accel-Buffering", "no");
     responseHeaders.set("Cache-Control", "no-store");
 
-    // Preserve DeepSeek SSE/body streaming all the way back to the browser.
+    // Stream DeepSeek SSE/body back unchanged. No buffering or parsing in the
+    // Worker, so request CPU cost stays nearly independent of history length.
     return new Response(upstream.body, {
       status: upstream.status,
       statusText: upstream.statusText,
@@ -103,14 +144,10 @@ export default {
   async fetch(request: Request, env: any, ctx: any) {
     const url = new URL(request.url);
 
-    // The custom domain is protected by Cloudflare Access. For those requests,
-    // bypass the Next.js/OpenNext route layer entirely so very large chat
-    // histories do not spend the Free-plan CPU budget in framework routing.
-    // workers.dev requests without Access keep using the existing Next handler.
-    if (
-      url.pathname.startsWith(`${DEEPSEEK_PROXY_PREFIX}/`) &&
-      hasCloudflareAccessIdentity(request)
-    ) {
+    // DeepSeek is the heavy long-context path. Bypass Next.js/OpenNext for it
+    // on BOTH the custom domain and workers.dev. Other UI/API requests still
+    // use the normal OpenNext worker.
+    if (url.pathname.startsWith(`${DEEPSEEK_PROXY_PREFIX}/`)) {
       return proxyDeepSeek(request, env);
     }
 
