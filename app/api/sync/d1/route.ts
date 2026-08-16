@@ -3,7 +3,7 @@ import { getCloudflareContext } from "@opennextjs/cloudflare";
 export const dynamic = "force-dynamic";
 
 const CHUNK_CHAR_SIZE = 400_000;
-const MAX_STATE_CHARS = 20_000_000;
+const MAX_STATE_CHARS = 16_000_000;
 
 function getUserId(request: Request) {
   const email = request.headers.get("cf-access-authenticated-user-email");
@@ -157,7 +157,7 @@ export async function POST(request: Request) {
       return jsonResponse(
         {
           error:
-            "Chat sync state is too large for automatic D1 sync (20M characters limit)",
+            "Chat sync state is too large for automatic D1 sync (16M characters limit)",
         },
         413,
       );
