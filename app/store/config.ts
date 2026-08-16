@@ -67,14 +67,17 @@ export const DEFAULT_CONFIG = {
     model: "gpt-4o-mini" as ModelType,
     providerName: "OpenAI" as ServiceProvider,
 
-    deepseekThinking: "high" as "off" | "low" | "high" | "max",
+    // DeepSeek defaults: save tokens for normal coding/chat workloads.
+    // Increase these from the model settings only when a task really needs it.
+    deepseekThinking: "off" as "off" | "high" | "max",
+    deepseekContextTokens: 256000 as 128000 | 256000 | 512000 | 850000,
 
     temperature: 0.5,
     top_p: 1,
     max_tokens: 4000,
     presence_penalty: 0,
     frequency_penalty: 0,
-    sendMemory: true,
+    sendMemory: false,
     historyMessageCount: 4,
     compressMessageLengthThreshold: 1000,
     compressModel: "",
@@ -198,7 +201,7 @@ export const useAppConfig = createPersistStore(
   }),
   {
     name: StoreKey.Config,
-    version: 4.1,
+    version: 4.2,
 
     merge(persistedState, currentState) {
       const state = persistedState as ChatConfig | undefined;
@@ -256,6 +259,16 @@ export const useAppConfig = createPersistStore(
           DEFAULT_CONFIG.modelConfig.compressModel;
         state.modelConfig.compressProviderName =
           DEFAULT_CONFIG.modelConfig.compressProviderName;
+      }
+
+      // Move existing installations to the safer DeepSeek defaults too,
+      // otherwise local persisted config would keep the previous High/Memory ON.
+      if (version < 4.2) {
+        state.modelConfig.deepseekThinking =
+          DEFAULT_CONFIG.modelConfig.deepseekThinking;
+        state.modelConfig.deepseekContextTokens =
+          DEFAULT_CONFIG.modelConfig.deepseekContextTokens;
+        state.modelConfig.sendMemory = false;
       }
 
       return state as any;
