@@ -27,6 +27,14 @@ import { fetch } from "@/app/utils/stream";
 
 const DEEPSEEK_DEFAULT_INPUT_TOKEN_BUDGET = 256_000;
 const DEEPSEEK_NON_STREAM_TIMEOUT_MS = 30 * 60 * 1000;
+const DEEPSEEK_NATIVE_SEARCH_MAX_USES = 3;
+const DEEPSEEK_ANTHROPIC_MAX_OUTPUT_TOKENS = 65_536;
+
+const DEEPSEEK_NATIVE_WEB_SEARCH_TOOL = {
+  type: "web_search_20250305",
+  name: "web_search",
+  max_uses: DEEPSEEK_NATIVE_SEARCH_MAX_USES,
+};
 
 type DeepSeekRequestPayload = Omit<
   RequestPayload,
@@ -41,6 +49,29 @@ type DeepSeekRequestPayload = Omit<
     thinking?: { type: "enabled" | "disabled" };
     reasoning_effort?: "high" | "max";
   };
+
+type DeepSeekAnthropicMessage = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+type DeepSeekAnthropicRequestPayload = {
+  model: string;
+  messages: DeepSeekAnthropicMessage[];
+  system?: string;
+  max_tokens: number;
+  stream: boolean;
+  tool_choice: { type: "auto" };
+  thinking: {
+    type: "enabled" | "disabled";
+    budget_tokens?: number;
+  };
+  output_config?: {
+    effort: "high" | "max";
+  };
+  temperature?: number;
+  top_p?: number;
+};
 
 function normalizeDeepSeekModel(model: string) {
   if (model === "deepseek-chat" || model === "deepseek-reasoner") {
@@ -91,6 +122,52 @@ function trimMessagesToTokenBudget(messages: any[], tokenBudget: number) {
   }
 
   return selected.reverse();
+}
+
+function buildAnthropicMessages(messages: ChatOptions["messages"]) {
+  const systemParts: string[] = [];
+  const anthropicMessages: DeepSeekAnthropicMessage[] = [];
+
+  for (const message of messages) {
+    const content = getMessageTextContent(message as any).trim();
+    if (!content) continue;
+
+    if (message.role === "system") {
+      systemParts.push(content);
+      continue;
+    }
+
+    const role: "user" | "assistant" =
+      message.role === "assistant" ? "assistant" : "user";
+    const previous = anthropicMessages.at(-1);
+
+    if (previous?.role === role) {
+      previous.content += `\n\n${content}`;
+    } else {
+      anthropicMessages.push({ role, content });
+    }
+  }
+
+  if (anthropicMessages[0]?.role === "assistant") {
+    anthropicMessages.unshift({ role: "user", content: ";" });
+  }
+
+  return {
+    system: systemParts.join("\n\n"),
+    messages: anthropicMessages,
+  };
+}
+
+function getDeepSeekAnthropicHeaders() {
+  const headers = getHeaders();
+  const authorization = headers.Authorization;
+
+  if (authorization) {
+    headers["x-api-key"] = authorization.replace(/^Bearer\s+/i, "").trim();
+  }
+
+  headers["anthropic-version"] = "2023-06-01";
+  return headers;
 }
 
 export class DeepSeekApi implements LLMApi {
@@ -147,10 +224,6 @@ export class DeepSeekApi implements LLMApi {
     const globalModelConfig = useAppConfig.getState().modelConfig;
     const sessionModelConfig = currentSession.mask.modelConfig;
 
-    // The config carried by this request is the most authoritative value.
-    // It comes from the current session in onUserInput(). This prevents an
-    // older global default (for example "off") from silently overriding a
-    // High/Max selection made for the current conversation.
     const modelConfig = {
       ...globalModelConfig,
       ...sessionModelConfig,
@@ -245,37 +318,141 @@ export class DeepSeekApi implements LLMApi {
     }
 
     const thinkingLevel = modelConfig.deepseekThinking ?? "off";
-    const requestPayload: DeepSeekRequestPayload = {
-      messages: filteredMessages,
-      stream: options.config.stream,
-      model: modelConfig.model,
-    };
-
-    if (thinkingLevel === "off") {
-      requestPayload.thinking = { type: "disabled" };
-      requestPayload.temperature = modelConfig.temperature;
-      requestPayload.presence_penalty = modelConfig.presence_penalty;
-      requestPayload.frequency_penalty = modelConfig.frequency_penalty;
-      requestPayload.top_p = modelConfig.top_p;
-    } else {
-      requestPayload.thinking = { type: "enabled" };
-      requestPayload.reasoning_effort = thinkingLevel === "max" ? "max" : "high";
-    }
-
-    console.log("[DeepSeek ChatCompletions Request]", {
-      model: requestPayload.model,
-      messageCount: requestPayload.messages?.length ?? 0,
-      contextTokenBudget,
-      selectedThinkingLevel: thinkingLevel,
-      thinking: requestPayload.thinking,
-      reasoningEffort: requestPayload.reasoning_effort,
-    });
-
     const shouldStream = !!options.config.stream;
     const controller = new AbortController();
     options.onController?.(controller);
 
     try {
+      // Normal interactive DeepSeek chat always has native web search available.
+      // The server tool uses tool_choice:auto, so the model decides whether a
+      // search is actually needed. Internal title/summarization calls continue
+      // to use Chat Completions and therefore do not trigger unnecessary search.
+      if (shouldStream && isInteractiveTurn) {
+        const anthropicInput = buildAnthropicMessages(filteredMessages);
+        const nativeSearchPayload: DeepSeekAnthropicRequestPayload = {
+          model: modelConfig.model,
+          messages: anthropicInput.messages,
+          system: anthropicInput.system || undefined,
+          max_tokens: DEEPSEEK_ANTHROPIC_MAX_OUTPUT_TOKENS,
+          stream: true,
+          tool_choice: { type: "auto" },
+          thinking:
+            thinkingLevel === "off"
+              ? { type: "disabled" }
+              : {
+                  type: "enabled",
+                  budget_tokens: thinkingLevel === "max" ? 16_384 : 8_192,
+                },
+          output_config:
+            thinkingLevel === "off"
+              ? undefined
+              : { effort: thinkingLevel === "max" ? "max" : "high" },
+          temperature:
+            thinkingLevel === "off" ? modelConfig.temperature : undefined,
+          top_p: thinkingLevel === "off" ? modelConfig.top_p : undefined,
+        };
+
+        const nativeSearchPath = this.path("anthropic/v1/messages");
+
+        console.log("[DeepSeek Native Search Request]", {
+          model: nativeSearchPayload.model,
+          messageCount: nativeSearchPayload.messages.length,
+          contextTokenBudget,
+          selectedThinkingLevel: thinkingLevel,
+          webSearch: "auto",
+          maxSearchUses: DEEPSEEK_NATIVE_SEARCH_MAX_USES,
+        });
+
+        return streamWithThink(
+          nativeSearchPath,
+          nativeSearchPayload,
+          getDeepSeekAnthropicHeaders(),
+          [DEEPSEEK_NATIVE_WEB_SEARCH_TOOL],
+          {},
+          controller,
+          (text: string) => {
+            const json = JSON.parse(text);
+
+            if (json.type === "content_block_start") {
+              const block = json.content_block ?? {};
+
+              if (block.type === "server_tool_use") {
+                console.log("[DeepSeek Native Web Search]", {
+                  name: block.name,
+                  input: block.input,
+                });
+              }
+
+              if (block.type === "thinking" && block.thinking) {
+                return {
+                  isThinking: true,
+                  content: String(block.thinking),
+                };
+              }
+
+              if (block.type === "text" && block.text) {
+                return {
+                  isThinking: false,
+                  content: String(block.text),
+                };
+              }
+            }
+
+            if (json.type === "content_block_delta") {
+              const delta = json.delta ?? {};
+
+              if (delta.type === "thinking_delta" && delta.thinking) {
+                return {
+                  isThinking: true,
+                  content: String(delta.thinking),
+                };
+              }
+
+              if (delta.type === "text_delta" && delta.text) {
+                return {
+                  isThinking: false,
+                  content: String(delta.text),
+                };
+              }
+            }
+
+            return { isThinking: false, content: "" };
+          },
+          () => {
+            // DeepSeek's web_search is a server-side Anthropic tool. It is
+            // executed by DeepSeek and never needs a client-side tool result.
+          },
+          options,
+        );
+      }
+
+      const requestPayload: DeepSeekRequestPayload = {
+        messages: filteredMessages,
+        stream: options.config.stream,
+        model: modelConfig.model,
+      };
+
+      if (thinkingLevel === "off") {
+        requestPayload.thinking = { type: "disabled" };
+        requestPayload.temperature = modelConfig.temperature;
+        requestPayload.presence_penalty = modelConfig.presence_penalty;
+        requestPayload.frequency_penalty = modelConfig.frequency_penalty;
+        requestPayload.top_p = modelConfig.top_p;
+      } else {
+        requestPayload.thinking = { type: "enabled" };
+        requestPayload.reasoning_effort =
+          thinkingLevel === "max" ? "max" : "high";
+      }
+
+      console.log("[DeepSeek ChatCompletions Request]", {
+        model: requestPayload.model,
+        messageCount: requestPayload.messages?.length ?? 0,
+        contextTokenBudget,
+        selectedThinkingLevel: thinkingLevel,
+        thinking: requestPayload.thinking,
+        reasoningEffort: requestPayload.reasoning_effort,
+      });
+
       const chatPath = this.path(DeepSeek.ChatPath);
 
       if (shouldStream) {
@@ -339,10 +516,7 @@ export class DeepSeekApi implements LLMApi {
               json.reasoning_content ??
               json.reasoning ??
               null;
-            const content =
-              delta.content ??
-              json.content ??
-              null;
+            const content = delta.content ?? json.content ?? null;
 
             if (reasoning) {
               return { isThinking: true, content: String(reasoning) };
@@ -393,7 +567,7 @@ export class DeepSeekApi implements LLMApi {
         clearTimeout(requestTimeoutId);
       }
     } catch (e) {
-      console.error("[DeepSeek ChatCompletions API Error]", e);
+      console.error("[DeepSeek API Error]", e);
       options.onError?.(e as Error);
     }
   }
