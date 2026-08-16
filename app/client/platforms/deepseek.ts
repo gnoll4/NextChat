@@ -122,7 +122,19 @@ export class DeepSeekApi implements LLMApi {
   }
 
   extractMessage(res: any) {
-    return res.choices?.at(0)?.message?.content ?? "";
+    const message = res.choices?.at(0)?.message;
+    const reasoning = message?.reasoning_content ?? "";
+    const content = message?.content ?? "";
+
+    if (reasoning) {
+      const quotedReasoning = String(reasoning)
+        .split("\n")
+        .map((line) => `> ${line}`)
+        .join("\n");
+      return `${quotedReasoning}\n\n${content}`;
+    }
+
+    return content;
   }
 
   speech(options: SpeechOptions): Promise<ArrayBuffer> {
@@ -135,8 +147,6 @@ export class DeepSeekApi implements LLMApi {
     const globalModelConfig = useAppConfig.getState().modelConfig;
     const sessionModelConfig = currentSession.mask.modelConfig;
 
-    // DeepSeek token controls are global preferences. This avoids an older
-    // session mask silently keeping High/850K after the user changes Settings.
     const modelConfig = {
       ...globalModelConfig,
       ...sessionModelConfig,
@@ -152,9 +162,6 @@ export class DeepSeekApi implements LLMApi {
       providerName: options.config.providerName,
     };
 
-    // Keep the existing Memory switch effective for the current conversation.
-    // It is OFF by default after config migration, which avoids extra summary
-    // requests when users repeatedly paste long source files.
     currentSession.mask.modelConfig.sendMemory = globalModelConfig.sendMemory;
 
     const contextTokenBudget =
@@ -278,6 +285,22 @@ export class DeepSeekApi implements LLMApi {
           controller,
           (text: string, runTools: ChatMessageTool[]) => {
             const json = JSON.parse(text);
+
+            // Compatibility with DeepSeek Responses-style SSE events.
+            if (json.type === "response.reasoning_text.delta") {
+              return {
+                isThinking: true,
+                content: json.delta ?? "",
+              };
+            }
+            if (json.type === "response.output_text.delta") {
+              return {
+                isThinking: false,
+                content: json.delta ?? "",
+              };
+            }
+
+            // Official Chat Completions streaming format.
             const choice = json.choices?.[0];
             const delta = choice?.delta ?? {};
             const toolCalls = delta.tool_calls as ChatMessageTool[] | undefined;
@@ -305,11 +328,25 @@ export class DeepSeekApi implements LLMApi {
               }
             }
 
-            const reasoning = delta.reasoning_content as string | null;
-            const content = delta.content as string | null;
+            // reasoning_content is the official field. The additional fallbacks
+            // make the UI tolerant of compatible gateways/proxies.
+            const reasoning =
+              delta.reasoning_content ??
+              delta.reasoning ??
+              json.reasoning_content ??
+              json.reasoning ??
+              null;
+            const content =
+              delta.content ??
+              json.content ??
+              null;
 
-            if (reasoning) return { isThinking: true, content: reasoning };
-            if (content) return { isThinking: false, content };
+            if (reasoning) {
+              return { isThinking: true, content: String(reasoning) };
+            }
+            if (content) {
+              return { isThinking: false, content: String(content) };
+            }
             return { isThinking: false, content: "" };
           },
           (
