@@ -30,6 +30,7 @@ import { type ClientApi, getClientApi } from "../client/api";
 import { useAccessStore } from "../store";
 import clsx from "clsx";
 import { initializeMcpSystem, isMcpEnabled } from "../mcp/actions";
+import { DeepSeekQuickControls } from "./deepseek-quick-controls";
 
 export function Loading(props: { noLogo?: boolean }) {
   return (
@@ -162,6 +163,7 @@ function Screen() {
   const location = useLocation();
   const isArtifact = location.pathname.includes(Path.Artifacts);
   const isHome = location.pathname === Path.Home;
+  const isChat = isHome || location.pathname === Path.Chat;
   const isAuth = location.pathname === Path.Auth;
   const isSd = location.pathname === Path.Sd;
   const isSdNew = location.pathname === Path.SdNew;
@@ -193,16 +195,27 @@ function Screen() {
           })}
         />
         <WindowContent>
-          <Routes>
-            <Route path={Path.Home} element={<Chat />} />
-            <Route path={Path.NewChat} element={<NewChat />} />
-            <Route path={Path.Masks} element={<MaskPage />} />
-            <Route path={Path.Plugins} element={<PluginPage />} />
-            <Route path={Path.SearchChat} element={<SearchChat />} />
-            <Route path={Path.Chat} element={<Chat />} />
-            <Route path={Path.Settings} element={<Settings />} />
-            <Route path={Path.McpMarket} element={<McpMarketPage />} />
-          </Routes>
+          {isChat && <DeepSeekQuickControls />}
+          <div
+            style={{
+              flex: 1,
+              minHeight: 0,
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+            }}
+          >
+            <Routes>
+              <Route path={Path.Home} element={<Chat />} />
+              <Route path={Path.NewChat} element={<NewChat />} />
+              <Route path={Path.Masks} element={<MaskPage />} />
+              <Route path={Path.Plugins} element={<PluginPage />} />
+              <Route path={Path.SearchChat} element={<SearchChat />} />
+              <Route path={Path.Chat} element={<Chat />} />
+              <Route path={Path.Settings} element={<Settings />} />
+              <Route path={Path.McpMarket} element={<McpMarketPage />} />
+            </Routes>
+          </div>
         </WindowContent>
       </>
     );
