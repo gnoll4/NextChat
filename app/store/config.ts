@@ -57,18 +57,19 @@ export const DEFAULT_CONFIG = {
 
   disablePromptHint: false,
 
-  dontShowMaskSplashScreen: false, // dont show splash screen when create chat
+  dontShowMaskSplashScreen: false, // dont add builtin masks
   hideBuiltinMasks: false, // dont add builtin masks
 
   customModels: "",
   models: DEFAULT_MODELS as any as LLMModel[],
 
   modelConfig: {
-    model: "gpt-4o-mini" as ModelType,
-    providerName: "OpenAI" as ServiceProvider,
+    // DeepSeek is the default provider. The DeepSeek client normalizes this
+    // compatibility model name to the current V4 chat model at request time.
+    model: "deepseek-chat" as ModelType,
+    providerName: ServiceProvider.DeepSeek,
 
     // DeepSeek defaults: save tokens for normal coding/chat workloads.
-    // Increase these from the model settings only when a task really needs it.
     deepseekThinking: "off" as "off" | "high" | "max",
     deepseekContextTokens: 256000 as 128000 | 256000 | 512000 | 850000,
 
@@ -80,8 +81,11 @@ export const DEFAULT_CONFIG = {
     sendMemory: false,
     historyMessageCount: 4,
     compressMessageLengthThreshold: 1000,
-    compressModel: "",
-    compressProviderName: "",
+
+    // Topic/title and memory summaries also use DeepSeek by default.
+    compressModel: "deepseek-chat" as ModelType,
+    compressProviderName: ServiceProvider.DeepSeek,
+
     enableInjectSystemPrompts: true,
     template: config?.template ?? DEFAULT_INPUT_TEMPLATE,
     size: "1024x1024" as ModelSize,
@@ -201,7 +205,7 @@ export const useAppConfig = createPersistStore(
   }),
   {
     name: StoreKey.Config,
-    version: 4.2,
+    version: 4.3,
 
     merge(persistedState, currentState) {
       const state = persistedState as ChatConfig | undefined;
@@ -261,14 +265,24 @@ export const useAppConfig = createPersistStore(
           DEFAULT_CONFIG.modelConfig.compressProviderName;
       }
 
-      // Move existing installations to the safer DeepSeek defaults too,
-      // otherwise local persisted config would keep the previous High/Memory ON.
       if (version < 4.2) {
         state.modelConfig.deepseekThinking =
           DEFAULT_CONFIG.modelConfig.deepseekThinking;
         state.modelConfig.deepseekContextTokens =
           DEFAULT_CONFIG.modelConfig.deepseekContextTokens;
         state.modelConfig.sendMemory = false;
+      }
+
+      // Existing installations should pick up DeepSeek as the application
+      // default too. Sessions that explicitly opted out of global config keep
+      // their own model; syncGlobalConfig sessions are updated on the home bar.
+      if (version < 4.3) {
+        state.modelConfig.model = DEFAULT_CONFIG.modelConfig.model;
+        state.modelConfig.providerName = DEFAULT_CONFIG.modelConfig.providerName;
+        state.modelConfig.compressModel =
+          DEFAULT_CONFIG.modelConfig.compressModel;
+        state.modelConfig.compressProviderName =
+          DEFAULT_CONFIG.modelConfig.compressProviderName;
       }
 
       return state as any;
