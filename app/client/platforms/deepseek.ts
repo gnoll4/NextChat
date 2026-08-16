@@ -25,7 +25,7 @@ import {
 import { RequestPayload } from "./openai";
 import { fetch } from "@/app/utils/stream";
 
-const DEEPSEEK_INPUT_TOKEN_BUDGET = 850_000;
+const DEEPSEEK_DEFAULT_INPUT_TOKEN_BUDGET = 256_000;
 const DEEPSEEK_NON_STREAM_TIMEOUT_MS = 30 * 60 * 1000;
 
 type DeepSeekRequestPayload = Omit<
@@ -132,6 +132,33 @@ export class DeepSeekApi implements LLMApi {
   async chat(options: ChatOptions) {
     const chatStore = useChatStore.getState();
     const currentSession = chatStore.currentSession();
+    const globalModelConfig = useAppConfig.getState().modelConfig;
+    const sessionModelConfig = currentSession.mask.modelConfig;
+
+    // DeepSeek token controls are global preferences. This avoids an older
+    // session mask silently keeping High/850K after the user changes Settings.
+    const modelConfig = {
+      ...globalModelConfig,
+      ...sessionModelConfig,
+      deepseekThinking:
+        globalModelConfig.deepseekThinking ??
+        sessionModelConfig.deepseekThinking ??
+        "off",
+      deepseekContextTokens:
+        globalModelConfig.deepseekContextTokens ??
+        sessionModelConfig.deepseekContextTokens ??
+        DEEPSEEK_DEFAULT_INPUT_TOKEN_BUDGET,
+      model: normalizeDeepSeekModel(options.config.model),
+      providerName: options.config.providerName,
+    };
+
+    // Keep the existing Memory switch effective for the current conversation.
+    // It is OFF by default after config migration, which avoids extra summary
+    // requests when users repeatedly paste long source files.
+    currentSession.mask.modelConfig.sendMemory = globalModelConfig.sendMemory;
+
+    const contextTokenBudget =
+      modelConfig.deepseekContextTokens ?? DEEPSEEK_DEFAULT_INPUT_TOKEN_BUDGET;
     const persistedMessages = currentSession.messages ?? [];
     const lastPersistedMessage = persistedMessages.at(-1) as any;
 
@@ -162,7 +189,7 @@ export class DeepSeekApi implements LLMApi {
 
       const historyBudget = Math.max(
         32_000,
-        DEEPSEEK_INPUT_TOKEN_BUDGET - supplementalTokenCount,
+        contextTokenBudget - supplementalTokenCount,
       );
 
       sourceMessages = [
@@ -173,7 +200,7 @@ export class DeepSeekApi implements LLMApi {
       console.log("[DeepSeek Context]", {
         persistedMessages: persistedMessages.length,
         selectedMessages: sourceMessages.length,
-        inputTokenBudget: DEEPSEEK_INPUT_TOKEN_BUDGET,
+        inputTokenBudget: contextTokenBudget,
       });
     }
 
@@ -204,14 +231,7 @@ export class DeepSeekApi implements LLMApi {
       }
     }
 
-    const modelConfig = {
-      ...useAppConfig.getState().modelConfig,
-      ...currentSession.mask.modelConfig,
-      model: normalizeDeepSeekModel(options.config.model),
-      providerName: options.config.providerName,
-    };
-
-    const thinkingLevel = modelConfig.deepseekThinking ?? "high";
+    const thinkingLevel = modelConfig.deepseekThinking ?? "off";
     const requestPayload: DeepSeekRequestPayload = {
       messages: filteredMessages,
       stream: options.config.stream,
@@ -232,6 +252,7 @@ export class DeepSeekApi implements LLMApi {
     console.log("[DeepSeek ChatCompletions Request]", {
       model: requestPayload.model,
       messageCount: requestPayload.messages?.length ?? 0,
+      contextTokenBudget,
       thinking: requestPayload.thinking,
       reasoningEffort: requestPayload.reasoning_effort,
     });
