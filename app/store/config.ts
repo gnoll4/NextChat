@@ -84,7 +84,7 @@ export const DEFAULT_CONFIG = {
 
     // Topic/title and memory summaries also use DeepSeek by default.
     compressModel: "deepseek-chat" as ModelType,
-    compressProviderName: ServiceProvider.DeepSeek,
+    compressProviderName: ServiceProvider.DeepSeek as ServiceProvider | "",
 
     enableInjectSystemPrompts: true,
     template: config?.template ?? DEFAULT_INPUT_TEMPLATE,
