@@ -281,6 +281,13 @@ export function getMessageImages(message: RequestMessage): string[] {
 }
 
 export function isVisionModel(model: string) {
+  // DeepSeek V4 API models are text-only. Keep this guard ahead of custom
+  // VISION_MODELS so a stale/mistaken environment setting cannot expose image
+  // upload UI or clipboard image handling for DeepSeek conversations.
+  if (model.toLowerCase().startsWith("deepseek")) {
+    return false;
+  }
+
   const visionModels = useAccessStore.getState().visionModels;
   const envVisionModels = visionModels?.split(",").map((m) => m.trim());
   if (envVisionModels?.includes(model)) {
