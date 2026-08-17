@@ -41,6 +41,17 @@ import { extractMcpJson, isMcpJson } from "../mcp/utils";
 
 const localStorage = safeLocalStorage();
 
+// Summaries are runtime background jobs, not persisted state. Serialize them per
+// session so an older title/memory request can never race a newer one and write
+// stale data back over a long conversation.
+const summarizingSessionIds = new Set<string>();
+const pendingSummarizeSessionIds = new Set<string>();
+const TITLE_SUMMARY_INPUT_TOKEN_BUDGET = 8_000;
+
+export function isChatSummarizing() {
+  return summarizingSessionIds.size > 0;
+}
+
 export type ChatMessageTool = {
   id: string;
   index?: number;
@@ -73,6 +84,33 @@ export function createMessage(override: Partial<ChatMessage>): ChatMessage {
     content: "",
     ...override,
   };
+}
+
+function truncateMessageForTitle(message: ChatMessage): ChatMessage {
+  const text = getMessageTextContent(message);
+  if (estimateTokenLength(text) <= TITLE_SUMMARY_INPUT_TOKEN_BUDGET) {
+    return message;
+  }
+
+  let low = 0;
+  let high = text.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (
+      estimateTokenLength(text.slice(0, mid)) <=
+      TITLE_SUMMARY_INPUT_TOKEN_BUDGET
+    ) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return createMessage({
+    role: message.role,
+    content: `${text.slice(0, low)}\n[标题生成仅使用了这条超长消息的开头摘录]`,
+    date: message.date,
+  });
 }
 
 export interface ChatStat {
@@ -283,7 +321,7 @@ export const useChatStore = createPersistStore(
         set((state) => {
           const { sessions, currentSessionIndex: oldIndex } = state;
 
-          // move the session
+          // move session
           const newSessions = [...sessions];
           const session = newSessions[from];
           newSessions.splice(from, 1);
@@ -665,12 +703,11 @@ export const useChatStore = createPersistStore(
         const config = useAppConfig.getState();
         const session = targetSession;
         const modelConfig = session.mask.modelConfig;
-        // skip summarize when using dalle3?
+
         if (isDalle3(modelConfig.model)) {
           return;
         }
 
-        // if not config compressModel, then using getSummarizeModel
         const [model, providerName] = modelConfig.compressModel
           ? [modelConfig.compressModel, modelConfig.compressProviderName]
           : getSummarizeModel(
@@ -678,90 +715,81 @@ export const useChatStore = createPersistStore(
               session.mask.modelConfig.providerName,
             );
         const api: ClientApi = getClientApi(providerName as ServiceProvider);
-
-        // remove error messages if any
         const messages = session.messages;
 
-        // should summarize topic after chating more than 50 words
-        const SUMMARIZE_MIN_LEN = 50;
-        if (
-          (config.enableAutoGenerateTitle &&
-            session.topic === DEFAULT_TOPIC &&
-            countMessages(messages) >= SUMMARIZE_MIN_LEN) ||
-          refreshTitle
-        ) {
-          const startIndex = Math.max(
-            0,
-            messages.length - modelConfig.historyMessageCount,
-          );
-          const topicMessages = messages
-            .slice(
-              startIndex < messages.length ? startIndex : messages.length - 1,
-              messages.length,
-            )
-            .concat(
-              createMessage({
-                role: "user",
-                content: Locale.Store.Prompt.Topic,
-              }),
-            );
-          api.llm.chat({
-            messages: topicMessages,
-            config: {
-              model,
-              stream: false,
-              providerName,
-            },
-            onFinish(message, responseRes) {
-              if (responseRes?.status === 200) {
-                get().updateTargetSession(
-                  session,
-                  (session) =>
-                    (session.topic =
-                      message.length > 0 ? trimTopic(message) : DEFAULT_TOPIC),
-                );
-              }
-            },
-          });
-        }
         const summarizeIndex = Math.max(
           session.lastSummarizeIndex,
           session.clearContextIndex ?? 0,
         );
-        let toBeSummarizedMsgs = messages
-          .filter((msg) => !msg.isError)
-          .slice(summarizeIndex);
-
-        const historyMsgLength = countMessages(toBeSummarizedMsgs);
-
-        if (historyMsgLength > (modelConfig?.max_tokens || 4000)) {
-          const n = toBeSummarizedMsgs.length;
-          toBeSummarizedMsgs = toBeSummarizedMsgs.slice(
-            Math.max(0, n - modelConfig.historyMessageCount),
-          );
-        }
-        const memoryPrompt = get().getMemoryPrompt();
-        if (memoryPrompt) {
-          // add memory prompt
-          toBeSummarizedMsgs.unshift(memoryPrompt);
-        }
-
-        const lastSummarizeIndex = session.messages.length;
-
-        console.log(
-          "[Chat History] ",
-          toBeSummarizedMsgs,
-          historyMsgLength,
-          modelConfig.compressMessageLengthThreshold,
+        const unsummarizedMessages = messages
+          .slice(summarizeIndex)
+          .filter((msg) => !msg.isError);
+        const historyMsgLength = countMessages(unsummarizedMessages);
+        const shouldSummarizeMemory = Boolean(
+          modelConfig.sendMemory &&
+            historyMsgLength > modelConfig.compressMessageLengthThreshold,
         );
 
-        if (
-          historyMsgLength > modelConfig.compressMessageLengthThreshold &&
-          modelConfig.sendMemory
-        ) {
-          /** Destruct max_tokens while summarizing
-           * this param is just shit
-           **/
+        const SUMMARIZE_MIN_LEN = 50;
+        const shouldSummarizeTitle = Boolean(
+          refreshTitle ||
+            (config.enableAutoGenerateTitle &&
+              session.topic === DEFAULT_TOPIC &&
+              countMessages(messages) >= SUMMARIZE_MIN_LEN),
+        );
+
+        if (!shouldSummarizeMemory && !shouldSummarizeTitle) {
+          return;
+        }
+
+        // One title/memory request per session at a time. A new message arriving
+        // while one is active only records that another pass is required.
+        if (summarizingSessionIds.has(session.id)) {
+          pendingSummarizeSessionIds.add(session.id);
+          return;
+        }
+        summarizingSessionIds.add(session.id);
+
+        const finishSummaryRequest = (forceFollowUp = false) => {
+          summarizingSessionIds.delete(session.id);
+          const hasPending = pendingSummarizeSessionIds.delete(session.id);
+
+          // Notify subscribers only after the background model request is no
+          // longer considered active. D1 can then schedule one debounced sync.
+          get().updateTargetSession(session, (targetSession) => {
+            targetSession.lastUpdate = Date.now();
+          });
+
+          if (hasPending || forceFollowUp) {
+            queueMicrotask(() => get().summarizeSession(false, session));
+          }
+        };
+
+        if (shouldSummarizeMemory) {
+          // Do not truncate unsummarized input based on modelConfig.max_tokens.
+          // max_tokens is an output setting, and the previous code could silently
+          // drop most of a long answer before creating its memory summary.
+          const toBeSummarizedMsgs = unsummarizedMessages.slice();
+
+          if (session.memoryPrompt.trim()) {
+            toBeSummarizedMsgs.unshift(
+              createMessage({
+                role: "system",
+                content: Locale.Store.Prompt.History(session.memoryPrompt),
+                date: "",
+              }),
+            );
+          }
+
+          const lastSummarizeIndex = session.messages.length;
+
+          console.log("[Chat History]", {
+            sessionId: session.id,
+            unsummarizedMessages: unsummarizedMessages.length,
+            unsummarizedTokens: Math.round(historyMsgLength),
+            threshold: modelConfig.compressMessageLengthThreshold,
+          });
+
           const { max_tokens, ...modelcfg } = modelConfig;
           api.llm.chat({
             messages: toBeSummarizedMsgs.concat(
@@ -773,27 +801,90 @@ export const useChatStore = createPersistStore(
             ),
             config: {
               ...modelcfg,
-              stream: true,
+              // Memory is internal state, so there is no value in exposing a
+              // partially streamed summary to the session. Commit it atomically
+              // only after a successful response.
+              stream: false,
               model,
               providerName,
             },
-            onUpdate(message) {
-              session.memoryPrompt = message;
-            },
             onFinish(message, responseRes) {
-              if (responseRes?.status === 200) {
-                console.log("[Memory] ", message);
-                get().updateTargetSession(session, (session) => {
-                  session.lastSummarizeIndex = lastSummarizeIndex;
-                  session.memoryPrompt = message; // Update the memory prompt for stored it in local storage
+              let memorySaved = false;
+              if (responseRes?.status === 200 && message.trim()) {
+                memorySaved = true;
+                console.log("[Memory]", {
+                  sessionId: session.id,
+                  summarizedThrough: lastSummarizeIndex,
+                  memoryLength: message.length,
+                });
+                get().updateTargetSession(session, (targetSession) => {
+                  targetSession.lastSummarizeIndex = lastSummarizeIndex;
+                  targetSession.memoryPrompt = message;
                 });
               }
+
+              // If the first long answer also needs a title, do that only after
+              // memory has actually been stored instead of running two model
+              // requests concurrently through the same Worker.
+              const needsTitleFollowUp = Boolean(
+                memorySaved &&
+                  config.enableAutoGenerateTitle &&
+                  session.topic === DEFAULT_TOPIC,
+              );
+              finishSummaryRequest(needsTitleFollowUp);
             },
             onError(err) {
-              console.error("[Summarize] ", err);
+              console.error("[Summarize]", err);
+              finishSummaryRequest(false);
             },
           });
+          return;
         }
+
+        // Title generation intentionally uses recent user turns rather than a
+        // huge assistant answer. Each user turn is also capped to a small input
+        // excerpt so a pasted book/log is not re-uploaded just for a sidebar title.
+        const recentUserMessages = messages
+          .filter((msg) => !msg.isError && msg.role === "user")
+          .slice(-Math.max(1, Math.min(modelConfig.historyMessageCount, 4)))
+          .map(truncateMessageForTitle);
+        const topicBaseMessages =
+          recentUserMessages.length > 0
+            ? recentUserMessages
+            : messages
+                .filter((msg) => !msg.isError)
+                .slice(-1)
+                .map(truncateMessageForTitle);
+        const topicMessages = topicBaseMessages.concat(
+          createMessage({
+            role: "user",
+            content: Locale.Store.Prompt.Topic,
+          }),
+        );
+
+        api.llm.chat({
+          messages: topicMessages,
+          config: {
+            model,
+            stream: false,
+            providerName,
+          },
+          onFinish(message, responseRes) {
+            if (responseRes?.status === 200) {
+              get().updateTargetSession(
+                session,
+                (targetSession) =>
+                  (targetSession.topic =
+                    message.length > 0 ? trimTopic(message) : DEFAULT_TOPIC),
+              );
+            }
+            finishSummaryRequest(false);
+          },
+          onError(err) {
+            console.error("[Summarize Topic]", err);
+            finishSummaryRequest(false);
+          },
+        });
       },
 
       updateStat(message: ChatMessage, session: ChatSession) {

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
-import { useChatStore } from "../store";
+import { isChatSummarizing, useChatStore } from "../store/chat";
 import {
   ChatSyncState,
   getLocalChatState,
@@ -81,6 +81,10 @@ function isChatStreaming() {
   });
 }
 
+function isChatBusy() {
+  return isChatStreaming() || isChatSummarizing();
+}
+
 async function waitForChatHydration() {
   if (useChatStore.getState()._hasHydrated) return;
 
@@ -114,7 +118,7 @@ export function D1ChatSync() {
     };
 
     const push = async () => {
-      if (disposed || !ready || applyingRemote || isChatStreaming()) return;
+      if (disposed || !ready || applyingRemote || isChatBusy()) return;
 
       if (pushInFlight) {
         pushAgain = true;
@@ -150,7 +154,7 @@ export function D1ChatSync() {
 
     const schedulePush = () => {
       cancelScheduledPush();
-      if (!ready || applyingRemote || disposed || isChatStreaming()) return;
+      if (!ready || applyingRemote || disposed || isChatBusy()) return;
 
       pushTimer = setTimeout(() => {
         pushTimer = undefined;
@@ -189,9 +193,9 @@ export function D1ChatSync() {
     const pull = async () => {
       if (disposed) return false;
 
-      // Never compete with a live DeepSeek SSE connection for the same Worker
-      // isolate. The next focus event or post-stream store update will retry.
-      if (isChatStreaming()) {
+      // Do not make D1 compete with either the live assistant SSE connection or
+      // a background title/memory summary request in the same Worker isolate.
+      if (isChatBusy()) {
         lastPullAt = Date.now();
         return true;
       }
@@ -262,7 +266,7 @@ export function D1ChatSync() {
     const onFocus = () => {
       if (
         ready &&
-        !isChatStreaming() &&
+        !isChatBusy() &&
         Date.now() - lastPullAt >= FOCUS_PULL_MIN_INTERVAL_MS
       ) {
         void pull();
@@ -272,7 +276,7 @@ export function D1ChatSync() {
     const onVisibilityChange = () => {
       if (document.visibilityState === "visible") {
         onFocus();
-      } else if (ready && !isChatStreaming()) {
+      } else if (ready && !isChatBusy()) {
         schedulePush();
       }
     };
@@ -298,10 +302,11 @@ export function D1ChatSync() {
       unsubscribe = useChatStore.subscribe((state) => {
         trackLocalSessionChanges(state.sessions);
 
-        // A live assistant message changes on every streamed chunk. Do not let
-        // those updates create D1 traffic. Once streaming flips to false, this
-        // same subscription schedules one normal debounced snapshot upload.
-        if (isChatStreaming()) {
+        // Streaming chunks and summary state updates can be very frequent or
+        // large. Cancel D1 traffic while either model operation is active. The
+        // summary finalizer emits one normal store update after becoming idle,
+        // which schedules the eventual debounced snapshot upload.
+        if (isChatBusy()) {
           cancelScheduledPush();
           return;
         }
@@ -314,7 +319,9 @@ export function D1ChatSync() {
 
       schedulePush();
 
-      console.log("[D1 Sync] automatic chat sync enabled (paused during streams)");
+      console.log(
+        "[D1 Sync] automatic chat sync enabled (paused during streams and summaries)",
+      );
     };
 
     void bootstrap();

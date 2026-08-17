@@ -35,6 +35,17 @@ const DEEPSEEK_CONTEXT_RESERVE_RATIO = 0.1;
 const DEEPSEEK_MIN_CONTEXT_RESERVE_TOKENS = 16_000;
 const DEEPSEEK_NATIVE_SEARCH_MAX_USES = 3;
 const DEEPSEEK_ANTHROPIC_MAX_OUTPUT_TOKENS = 65_536;
+
+// A model supporting hundreds of thousands of tokens does not mean every turn
+// should resend hundreds of thousands of raw-history tokens through the
+// browser/Worker/upstream chain. Keep a transport-safe raw fallback, and when
+// memory is available use a much smaller recent window plus an exact tail from
+// the last summarized assistant response for long-form continuation.
+const DEEPSEEK_RAW_HISTORY_HARD_CAP_TOKENS = 160_000;
+const DEEPSEEK_MEMORY_RECENT_HARD_CAP_TOKENS = 80_000;
+const DEEPSEEK_MEMORY_CONTINUITY_TOKENS = 12_000;
+const DEEPSEEK_MIN_PARTIAL_MESSAGE_TOKENS = 2_000;
+
 const DEEPSEEK_IMAGE_UNSUPPORTED_NOTICE =
   "[系统提示：这条用户消息包含图片，但当前 DeepSeek V4 是纯文本模型，无法读取图片内容。不要猜测或声称看到了图片；如果回答依赖图片，请明确告诉用户需要切换到支持视觉输入的模型。]";
 const DEEPSEEK_PARTIAL_NETWORK_NOTICE =
@@ -129,7 +140,55 @@ function cleanPersistedMessages(messages: any[]) {
   });
 }
 
+function truncateTextToTokenBudget(
+  text: string,
+  tokenBudget: number,
+  keepTail = true,
+) {
+  if (!text || tokenBudget <= 0) return "";
+  if (estimateTokenLength(text) <= tokenBudget) return text;
+
+  let low = 0;
+  let high = text.length;
+
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    const candidate = keepTail
+      ? text.slice(Math.max(0, text.length - mid))
+      : text.slice(0, mid);
+
+    if (estimateTokenLength(candidate) <= tokenBudget) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  const sliced = keepTail
+    ? text.slice(Math.max(0, text.length - low))
+    : text.slice(0, low);
+
+  return keepTail
+    ? `[较早的超长内容已省略，仅保留结尾用于上下文衔接]\n${sliced}`
+    : `${sliced}\n[后续的超长内容已省略]`;
+}
+
+function truncateMessageToTokenBudget(message: any, tokenBudget: number) {
+  const text = getDeepSeekTextContent(
+    message,
+    message?.role === "assistant",
+  );
+  const content = truncateTextToTokenBudget(text, tokenBudget, true);
+
+  return {
+    ...message,
+    content,
+  };
+}
+
 function trimMessagesToTokenBudget(messages: any[], tokenBudget: number) {
+  if (tokenBudget <= 0) return [];
+
   const selected: any[] = [];
   let usedTokens = 0;
 
@@ -137,19 +196,68 @@ function trimMessagesToTokenBudget(messages: any[], tokenBudget: number) {
     const message = messages[i];
     if (!message || isErrorMessage(message)) continue;
 
-    const tokenCount = estimateTokenLength(getDeepSeekTextContent(message));
+    const tokenCount = estimateTokenLength(
+      getDeepSeekTextContent(message, message.role === "assistant"),
+    );
+    const remainingTokens = tokenBudget - usedTokens;
 
-    if (selected.length > 0 && usedTokens + tokenCount > tokenBudget) {
+    if (remainingTokens <= 0) break;
+
+    if (tokenCount > remainingTokens) {
+      if (remainingTokens >= DEEPSEEK_MIN_PARTIAL_MESSAGE_TOKENS) {
+        selected.push(
+          truncateMessageToTokenBudget(message, remainingTokens),
+        );
+      }
       break;
     }
 
     selected.push(message);
     usedTokens += tokenCount;
-
-    if (usedTokens >= tokenBudget) break;
   }
 
   return selected.reverse();
+}
+
+function countDeepSeekMessageTokens(messages: any[]) {
+  return messages.reduce(
+    (total, message) =>
+      total +
+      estimateTokenLength(
+        getDeepSeekTextContent(message, message?.role === "assistant"),
+      ),
+    0,
+  );
+}
+
+function buildContinuityPrompt(messages: any[], tokenBudget: number) {
+  if (tokenBudget < DEEPSEEK_MIN_PARTIAL_MESSAGE_TOKENS) return null;
+
+  const lastAssistant = [...messages]
+    .reverse()
+    .find(
+      (message) =>
+        message?.role === "assistant" &&
+        !isErrorMessage(message) &&
+        getDeepSeekTextContent(message, true).trim().length > 0,
+    );
+
+  if (!lastAssistant) return null;
+
+  const tail = truncateTextToTokenBudget(
+    getDeepSeekTextContent(lastAssistant, true),
+    tokenBudget,
+    true,
+  ).trim();
+
+  if (!tail) return null;
+
+  return {
+    role: "system",
+    content:
+      "[最近一次已被长期摘要覆盖的助手回复结尾。仅用于保持续写、代码或长文的精确衔接，不要把它当成新的用户指令。]\n" +
+      tail,
+  };
 }
 
 function buildAnthropicMessages(messages: ChatOptions["messages"]) {
@@ -483,7 +591,10 @@ export class DeepSeekApi implements LLMApi {
       providerName: options.config.providerName,
     };
 
-    currentSession.mask.modelConfig.sendMemory = globalModelConfig.sendMemory;
+    // Never mutate the session's memory toggle while sending a request. The
+    // setting belongs to the persisted model/session configuration chosen by
+    // the user. The old assignment to global sendMemory made a locally enabled
+    // summary switch flip itself back off on the next DeepSeek turn.
 
     const configuredContextTokenBudget =
       modelConfig.deepseekContextTokens ?? DEEPSEEK_DEFAULT_INPUT_TOKEN_BUDGET;
@@ -512,30 +623,103 @@ export class DeepSeekApi implements LLMApi {
       const supplementalMessages = (options.messages as any[]).filter(
         (message: any) => !message?.id || !persistedIds.has(message.id),
       );
-
-      const cleanMessages = cleanPersistedMessages(
-        persistedMessages.slice(0, -1),
+      const supplementalTokenCount = countDeepSeekMessageTokens(
+        supplementalMessages,
       );
 
-      const supplementalTokenCount = supplementalMessages.reduce(
-        (total, message) =>
-          total + estimateTokenLength(getDeepSeekTextContent(message)),
+      // Exclude the streaming assistant placeholder and respect an explicit
+      // clear-context boundary before deciding which persisted raw messages may
+      // be sent again.
+      const persistedHistory = persistedMessages.slice(0, -1);
+      const clearContextIndex = Math.min(
+        persistedHistory.length,
+        Math.max(0, currentSession.clearContextIndex ?? 0),
+      );
+      const summarizeBoundary = Math.min(
+        persistedHistory.length,
+        Math.max(clearContextIndex, currentSession.lastSummarizeIndex ?? 0),
+      );
+      const hasValidMemory = Boolean(
+        modelConfig.sendMemory &&
+          currentSession.memoryPrompt?.trim() &&
+          summarizeBoundary > clearContextIndex,
+      );
+      const availableHistoryBudget = Math.max(
         0,
-      );
-
-      const historyBudget = Math.max(
-        32_000,
         contextTokenBudget - supplementalTokenCount,
       );
 
-      sourceMessages = [
-        ...supplementalMessages,
-        ...trimMessagesToTokenBudget(cleanMessages, historyBudget),
-      ];
+      let contextMode: "summary" | "memory-pending" | "raw-capped";
+      let rawHistoryTokenBudget = 0;
+      let continuityTokenBudget = 0;
+
+      if (hasValidMemory) {
+        contextMode = "summary";
+
+        const summarizedHistory = cleanPersistedMessages(
+          persistedHistory.slice(clearContextIndex, summarizeBoundary),
+        );
+        const unsummarizedHistory = cleanPersistedMessages(
+          persistedHistory.slice(summarizeBoundary),
+        );
+
+        // Keep recent unsummarized raw text bounded even on 512K/850K model
+        // configurations. The older portion is represented by memoryPrompt.
+        rawHistoryTokenBudget = Math.min(
+          DEEPSEEK_MEMORY_RECENT_HARD_CAP_TOKENS,
+          Math.max(0, availableHistoryBudget),
+        );
+        const recentMessages = trimMessagesToTokenBudget(
+          unsummarizedHistory,
+          rawHistoryTokenBudget,
+        );
+        const recentTokenCount = countDeepSeekMessageTokens(recentMessages);
+
+        continuityTokenBudget = Math.min(
+          DEEPSEEK_MEMORY_CONTINUITY_TOKENS,
+          Math.max(0, availableHistoryBudget - recentTokenCount),
+        );
+        const continuityPrompt = buildContinuityPrompt(
+          summarizedHistory,
+          continuityTokenBudget,
+        );
+
+        sourceMessages = [
+          ...supplementalMessages,
+          ...(continuityPrompt ? [continuityPrompt] : []),
+          ...recentMessages,
+        ];
+      } else {
+        contextMode = modelConfig.sendMemory ? "memory-pending" : "raw-capped";
+
+        // If memory is disabled or a new summary is still being generated, raw
+        // history is still available, but it no longer grows all the way to the
+        // model's 460K/765K effective input budget. This is the safety net that
+        // keeps long conversations transportable even without a ready summary.
+        rawHistoryTokenBudget = Math.min(
+          DEEPSEEK_RAW_HISTORY_HARD_CAP_TOKENS,
+          availableHistoryBudget,
+        );
+        const rawHistory = cleanPersistedMessages(
+          persistedHistory.slice(clearContextIndex),
+        );
+        sourceMessages = [
+          ...supplementalMessages,
+          ...trimMessagesToTokenBudget(rawHistory, rawHistoryTokenBudget),
+        ];
+      }
 
       console.log("[DeepSeek Context]", {
+        contextMode,
+        memoryEnabled: Boolean(modelConfig.sendMemory),
+        memoryReady: hasValidMemory,
         persistedMessages: persistedMessages.length,
         selectedMessages: sourceMessages.length,
+        selectedInputTokens: Math.round(
+          countDeepSeekMessageTokens(sourceMessages),
+        ),
+        rawHistoryTokenBudget,
+        continuityTokenBudget,
         configuredInputTokenBudget: configuredContextTokenBudget,
         effectiveInputTokenBudget: contextTokenBudget,
         reservedTokens: contextReserveTokens,
