@@ -1,6 +1,7 @@
 const DEEPSEEK_PROXY_PREFIX = "/api/deepseek";
 const D1_SYNC_PATH = "/api/sync/d1";
 const DEFAULT_DEEPSEEK_URL = "https://api.deepseek.com";
+const DEEPSEEK_MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 
 const D1_CHUNK_CHAR_SIZE = 400_000;
 const D1_MAX_STATE_CHARS = 8_000_000;
@@ -71,19 +72,62 @@ async function proxyDeepSeek(request: Request, env: any) {
     headers.set("Authorization", `Bearer ${apiKey}`);
   }
 
-  const init: RequestInit & { duplex?: "half" } = {
+  let requestBytes = 0;
+  let fixedBody: Uint8Array | undefined;
+
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    const declaredLength = Number(request.headers.get("content-length") || 0);
+    if (
+      Number.isFinite(declaredLength) &&
+      declaredLength > DEEPSEEK_MAX_REQUEST_BYTES
+    ) {
+      return jsonError(
+        `DeepSeek request body exceeds ${DEEPSEEK_MAX_REQUEST_BYTES} bytes`,
+        413,
+      );
+    }
+
+    try {
+      const bodyBuffer = await request.arrayBuffer();
+      requestBytes = bodyBuffer.byteLength;
+      if (requestBytes > DEEPSEEK_MAX_REQUEST_BYTES) {
+        return jsonError(
+          `DeepSeek request body exceeds ${DEEPSEEK_MAX_REQUEST_BYTES} bytes`,
+          413,
+        );
+      }
+      fixedBody = new Uint8Array(bodyBuffer);
+    } catch (error) {
+      if (request.signal.aborted) {
+        return jsonError("DeepSeek request aborted while reading body", 499);
+      }
+      console.error("[Dedicated DeepSeek Proxy Body Read]", error);
+      return jsonError(
+        error instanceof Error ? error.message : String(error),
+        400,
+      );
+    }
+  }
+
+  const init: RequestInit = {
     method: request.method,
     headers,
     redirect: "manual",
     signal: request.signal,
   };
 
-  if (request.method !== "GET" && request.method !== "HEAD") {
-    // Keep the potentially very large conversation body as a byte stream.
-    // Never text()/json()/clone()/buffer it in this dedicated Worker.
-    init.body = request.body;
-    init.duplex = "half";
+  if (fixedBody !== undefined) {
+    // Cloudflare sets Content-Length automatically for fixed-length bodies such
+    // as TypedArray. Using request.body directly here would make the Worker ->
+    // DeepSeek request use Chunked-Encoding again.
+    init.body = fixedBody;
   }
+
+  console.log("[Dedicated DeepSeek Proxy Request]", {
+    upstreamPath,
+    requestBytes,
+    fixedLength: true,
+  });
 
   try {
     const upstream = await fetch(upstreamUrl, init);
@@ -92,7 +136,14 @@ async function proxyDeepSeek(request: Request, env: any) {
     responseHeaders.set("X-Accel-Buffering", "no");
     responseHeaders.set("Cache-Control", "no-store");
     responseHeaders.set("X-NextChat-Edge-API", "dedicated");
-    responseHeaders.set("X-NextChat-DeepSeek-Proxy", "dedicated");
+    responseHeaders.set(
+      "X-NextChat-DeepSeek-Proxy",
+      "fixed-length-dedicated",
+    );
+    responseHeaders.set(
+      "X-NextChat-DeepSeek-Request-Bytes",
+      String(requestBytes),
+    );
 
     return new Response(upstream.body, {
       status: upstream.status,
