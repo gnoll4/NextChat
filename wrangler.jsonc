@@ -3,6 +3,7 @@
   "name": "nextchat",
   "main": "custom-worker.ts",
   "compatibility_date": "2026-08-15",
+  "workers_dev": true,
 
   "compatibility_flags": [
     "nodejs_compat",
