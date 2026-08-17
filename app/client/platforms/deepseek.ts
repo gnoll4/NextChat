@@ -28,10 +28,19 @@ import { fetch } from "@/app/utils/stream";
 
 const DEEPSEEK_DEFAULT_INPUT_TOKEN_BUDGET = 256_000;
 const DEEPSEEK_NON_STREAM_TIMEOUT_MS = 30 * 60 * 1000;
+const DEEPSEEK_STREAM_IDLE_TIMEOUT_MS = 12 * 60 * 1000;
+const DEEPSEEK_STREAM_NETWORK_RETRIES = 2;
+const DEEPSEEK_STREAM_RETRY_BASE_DELAY_MS = 1500;
+const DEEPSEEK_CONTEXT_RESERVE_RATIO = 0.1;
+const DEEPSEEK_MIN_CONTEXT_RESERVE_TOKENS = 16_000;
 const DEEPSEEK_NATIVE_SEARCH_MAX_USES = 3;
 const DEEPSEEK_ANTHROPIC_MAX_OUTPUT_TOKENS = 65_536;
 const DEEPSEEK_IMAGE_UNSUPPORTED_NOTICE =
   "[系统提示：这条用户消息包含图片，但当前 DeepSeek V4 是纯文本模型，无法读取图片内容。不要猜测或声称看到了图片；如果回答依赖图片，请明确告诉用户需要切换到支持视觉输入的模型。]";
+const DEEPSEEK_PARTIAL_NETWORK_NOTICE =
+  "网络连接在长输出过程中中断，已保留本次已经生成的内容。你可以直接回复“继续”，从中断处接着生成。";
+const DEEPSEEK_IDLE_TIMEOUT_NOTICE =
+  "本次长请求等待时间过长，已保留已经生成的内容。你可以直接回复“继续”，从这里接着生成。";
 
 const DEEPSEEK_NATIVE_WEB_SEARCH_TOOL = {
   type: "web_search_20250305",
@@ -189,6 +198,220 @@ function getDeepSeekAnthropicHeaders() {
   return headers;
 }
 
+function normalizeStreamError(error: unknown) {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function isRetriableStreamError(error: unknown) {
+  const normalized = normalizeStreamError(error);
+  const text = `${normalized.name}: ${normalized.message}`.toLowerCase();
+  return (
+    text.includes("failed to fetch") ||
+    text.includes("networkerror") ||
+    text.includes("network error") ||
+    text.includes("load failed") ||
+    text.includes("fetch failed") ||
+    text.includes("connection reset") ||
+    text.includes("econnreset") ||
+    text.includes("socket") ||
+    text.includes("terminated")
+  );
+}
+
+function partialResponse() {
+  return new Response(null, {
+    status: 206,
+    statusText: "Partial Content",
+    headers: { "X-NextChat-Partial": "1" },
+  });
+}
+
+function runResilientDeepSeekStream(
+  chatPath: string,
+  requestPayload: any,
+  headers: any,
+  tools: any[],
+  funcs: Record<string, Function>,
+  userController: AbortController,
+  parseSSE: (
+    text: string,
+    runTools: any[],
+  ) => { isThinking: boolean; content: string | undefined },
+  processToolMessage: (
+    requestPayload: any,
+    toolCallMessage: any,
+    toolCallResult: any[],
+  ) => void,
+  options: ChatOptions,
+) {
+  let retryCount = 0;
+  let latestText = "";
+  let settled = false;
+  let activeController: AbortController | undefined;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let abortForIdle: (() => void) | undefined;
+
+  const clearTimers = () => {
+    if (retryTimer) clearTimeout(retryTimer);
+    if (idleTimer) clearTimeout(idleTimer);
+    retryTimer = undefined;
+    idleTimer = undefined;
+  };
+
+  const finishOnce = (message: string, response?: Response) => {
+    if (settled) return;
+    settled = true;
+    clearTimers();
+    options.onFinish(message, response ?? partialResponse());
+  };
+
+  const failOnce = (error: unknown) => {
+    if (settled) return;
+    settled = true;
+    clearTimers();
+    options.onError?.(normalizeStreamError(error));
+  };
+
+  const resetIdleTimer = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      abortForIdle?.();
+    }, DEEPSEEK_STREAM_IDLE_TIMEOUT_MS);
+  };
+
+  userController.signal.addEventListener(
+    "abort",
+    () => {
+      if (retryTimer) clearTimeout(retryTimer);
+      activeController?.abort();
+    },
+    { once: true },
+  );
+
+  const startAttempt = () => {
+    if (settled || userController.signal.aborted) return;
+
+    const requestController = new AbortController();
+    activeController = requestController;
+    let suppressFinish = false;
+    let finishReason: "normal" | "network-partial" | "idle" = "normal";
+
+    // streamWithThink has a generic five-minute pre-response timeout. DeepSeek
+    // can legitimately keep a long request alive for longer, so its internal
+    // timeout is ignored here. The DeepSeek-specific idle watchdog below still
+    // aborts a genuinely stalled request after twelve minutes without output.
+    const timeoutController = {
+      signal: requestController.signal,
+      abort: () => {
+        console.warn(
+          "[DeepSeek Stream] generic stream timeout ignored; using DeepSeek idle watchdog",
+        );
+      },
+    } as AbortController;
+
+    abortForIdle = () => {
+      if (settled || requestController.signal.aborted) return;
+      finishReason = "idle";
+      requestController.abort();
+    };
+    resetIdleTimer();
+
+    const attemptOptions = {
+      ...options,
+      onController: undefined,
+      onUpdate(message: string, chunk: string) {
+        latestText = message;
+        resetIdleTimer();
+        options.onUpdate?.(message, chunk);
+      },
+      onFinish(message: string, response: Response) {
+        if (suppressFinish || settled) return;
+
+        if (finishReason === "network-partial") {
+          finishOnce(
+            `${message}\n\n> ⚠️ ${DEEPSEEK_PARTIAL_NETWORK_NOTICE}`,
+            response ?? partialResponse(),
+          );
+          return;
+        }
+
+        if (finishReason === "idle") {
+          if (message.trim()) {
+            finishOnce(
+              `${message}\n\n> ⚠️ ${DEEPSEEK_IDLE_TIMEOUT_NOTICE}`,
+              response ?? partialResponse(),
+            );
+          } else {
+            failOnce(
+              new Error(
+                "DeepSeek request timed out after 12 minutes without generated content",
+              ),
+            );
+          }
+          return;
+        }
+
+        finishOnce(message, response);
+      },
+      onError(error: Error) {
+        if (suppressFinish || settled || userController.signal.aborted) return;
+
+        const retryable = isRetriableStreamError(error);
+        const hasPartialOutput = latestText.trim().length > 0;
+
+        if (
+          retryable &&
+          !hasPartialOutput &&
+          retryCount < DEEPSEEK_STREAM_NETWORK_RETRIES
+        ) {
+          retryCount += 1;
+          suppressFinish = true;
+          requestController.abort();
+          const retryDelay =
+            DEEPSEEK_STREAM_RETRY_BASE_DELAY_MS * retryCount;
+          console.warn(
+            `[DeepSeek Stream] network error before output, retry ${retryCount}/${DEEPSEEK_STREAM_NETWORK_RETRIES} in ${retryDelay}ms`,
+            error,
+          );
+          retryTimer = setTimeout(() => {
+            retryTimer = undefined;
+            startAttempt();
+          }, retryDelay);
+          return;
+        }
+
+        if (retryable && hasPartialOutput) {
+          // Do not mark the whole turn as failed after a long answer has already
+          // been generated. Aborting makes streamWithThink flush its remaining
+          // buffered text through onFinish, and the conversation stays usable.
+          finishReason = "network-partial";
+          requestController.abort();
+          return;
+        }
+
+        suppressFinish = true;
+        requestController.abort();
+        failOnce(error);
+      },
+    };
+
+    streamWithThink(
+      chatPath,
+      requestPayload,
+      headers,
+      tools,
+      funcs,
+      timeoutController,
+      parseSSE,
+      processToolMessage,
+      attemptOptions,
+    );
+  };
+
+  startAttempt();
+}
+
 export class DeepSeekApi implements LLMApi {
   private disableListModels = true;
 
@@ -262,8 +485,16 @@ export class DeepSeekApi implements LLMApi {
 
     currentSession.mask.modelConfig.sendMemory = globalModelConfig.sendMemory;
 
-    const contextTokenBudget =
+    const configuredContextTokenBudget =
       modelConfig.deepseekContextTokens ?? DEEPSEEK_DEFAULT_INPUT_TOKEN_BUDGET;
+    const contextReserveTokens = Math.max(
+      DEEPSEEK_MIN_CONTEXT_RESERVE_TOKENS,
+      Math.floor(configuredContextTokenBudget * DEEPSEEK_CONTEXT_RESERVE_RATIO),
+    );
+    const contextTokenBudget = Math.max(
+      32_000,
+      configuredContextTokenBudget - contextReserveTokens,
+    );
     const persistedMessages = currentSession.messages ?? [];
     const lastPersistedMessage = persistedMessages.at(-1) as any;
 
@@ -305,7 +536,9 @@ export class DeepSeekApi implements LLMApi {
       console.log("[DeepSeek Context]", {
         persistedMessages: persistedMessages.length,
         selectedMessages: sourceMessages.length,
-        inputTokenBudget: contextTokenBudget,
+        configuredInputTokenBudget: configuredContextTokenBudget,
+        effectiveInputTokenBudget: contextTokenBudget,
+        reservedTokens: contextReserveTokens,
       });
     }
 
@@ -373,13 +606,14 @@ export class DeepSeekApi implements LLMApi {
         console.log("[DeepSeek Native Search Request]", {
           model: nativeSearchPayload.model,
           messageCount: nativeSearchPayload.messages.length,
-          contextTokenBudget,
+          configuredContextTokenBudget,
+          effectiveContextTokenBudget: contextTokenBudget,
           selectedThinkingLevel: thinkingLevel,
           webSearch: "auto",
           maxSearchUses: DEEPSEEK_NATIVE_SEARCH_MAX_USES,
         });
 
-        return streamWithThink(
+        return runResilientDeepSeekStream(
           nativeSearchPath,
           nativeSearchPayload,
           getDeepSeekAnthropicHeaders(),
@@ -463,7 +697,8 @@ export class DeepSeekApi implements LLMApi {
       console.log("[DeepSeek ChatCompletions Request]", {
         model: requestPayload.model,
         messageCount: requestPayload.messages?.length ?? 0,
-        contextTokenBudget,
+        configuredContextTokenBudget,
+        effectiveContextTokenBudget: contextTokenBudget,
         selectedThinkingLevel: thinkingLevel,
         thinking: requestPayload.thinking,
         reasoningEffort: requestPayload.reasoning_effort,
@@ -476,7 +711,7 @@ export class DeepSeekApi implements LLMApi {
           .getState()
           .getAsTools(currentSession.mask?.plugin || []);
 
-        return streamWithThink(
+        return runResilientDeepSeekStream(
           chatPath,
           requestPayload,
           getHeaders(),

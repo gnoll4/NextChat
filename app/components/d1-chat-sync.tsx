@@ -12,6 +12,67 @@ import {
 const SYNC_API = "/api/sync/d1";
 const PUSH_DEBOUNCE_MS = 20_000;
 const FOCUS_PULL_MIN_INTERVAL_MS = 60_000;
+const DELETED_SESSIONS_KEY = "nextchat-d1-deleted-sessions";
+
+type DeletedSessions = Record<string, number>;
+type D1ChatSyncState = ChatSyncState & {
+  deletedSessions?: DeletedSessions;
+};
+
+function loadDeletedSessions(): DeletedSessions {
+  try {
+    if (typeof window === "undefined") return {};
+    const raw = window.localStorage.getItem(DELETED_SESSIONS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveDeletedSessions(deletedSessions: DeletedSessions) {
+  try {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(
+      DELETED_SESSIONS_KEY,
+      JSON.stringify(deletedSessions),
+    );
+  } catch (error) {
+    console.warn("[D1 Sync] failed to persist deletion tombstones", error);
+  }
+}
+
+function mergeDeletedSessions(
+  localDeleted: DeletedSessions,
+  remoteDeleted: DeletedSessions,
+) {
+  const merged = { ...localDeleted };
+  Object.entries(remoteDeleted).forEach(([sessionId, deletedAt]) => {
+    const timestamp = Number(deletedAt) || 0;
+    if (timestamp > (merged[sessionId] ?? 0)) {
+      merged[sessionId] = timestamp;
+    }
+  });
+  return merged;
+}
+
+function filterDeletedSessions<T extends { sessions: { id: string }[] }>(
+  state: T,
+  deletedSessions: DeletedSessions,
+): T {
+  return {
+    ...state,
+    sessions: state.sessions.filter((session) => !deletedSessions[session.id]),
+  };
+}
+
+function buildLocalSyncState(): D1ChatSyncState {
+  return {
+    ...getLocalChatState(),
+    deletedSessions: loadDeletedSessions(),
+  };
+}
 
 async function waitForChatHydration() {
   if (useChatStore.getState()._hasHydrated) return;
@@ -36,6 +97,7 @@ export function D1ChatSync() {
     let pushAgain = false;
     let lastPullAt = 0;
     let unsubscribe: (() => void) | undefined;
+    let knownSessionIds = new Set<string>();
 
     const push = async () => {
       if (disposed || !ready || applyingRemote) return;
@@ -50,7 +112,7 @@ export function D1ChatSync() {
         // Serialize in the browser and send the JSON string directly. The
         // Worker stores this payload as opaque text, avoiding large JSON parse
         // and stringify work on Cloudflare's CPU budget.
-        const serialized = JSON.stringify(getLocalChatState());
+        const serialized = JSON.stringify(buildLocalSyncState());
         const response = await fetch(SYNC_API, {
           method: "POST",
           headers: {
@@ -82,6 +144,40 @@ export function D1ChatSync() {
         pushTimer = undefined;
         void push();
       }, PUSH_DEBOUNCE_MS);
+    };
+
+    const trackLocalSessionChanges = (sessions: { id: string }[]) => {
+      const currentIds = new Set(sessions.map((session) => session.id));
+      const deletedSessions = loadDeletedSessions();
+      const deletedAt = Date.now();
+      let changed = false;
+
+      // A session that disappeared locally is a real deletion, not merely an
+      // absent remote record. Persist a tombstone immediately so even a page
+      // refresh before the next D1 upload cannot resurrect it.
+      knownSessionIds.forEach((sessionId) => {
+        if (!currentIds.has(sessionId)) {
+          deletedSessions[sessionId] = Math.max(
+            deletedSessions[sessionId] ?? 0,
+            deletedAt,
+          );
+          changed = true;
+        }
+      });
+
+      // NextChat's delete action has a short Undo window. If the same session
+      // ID reappears locally before the tombstone is synced, treat that as an
+      // undo and remove the local tombstone.
+      currentIds.forEach((sessionId) => {
+        if (!knownSessionIds.has(sessionId) && deletedSessions[sessionId]) {
+          delete deletedSessions[sessionId];
+          changed = true;
+        }
+      });
+
+      if (changed) saveDeletedSessions(deletedSessions);
+      knownSessionIds = currentIds;
+      return changed;
     };
 
     const pull = async () => {
@@ -116,13 +212,33 @@ export function D1ChatSync() {
         const serialized = await response.text();
         if (!serialized || disposed) return true;
 
-        const remote = JSON.parse(serialized) as ChatSyncState;
+        const remote = JSON.parse(serialized) as D1ChatSyncState;
         if (!remote?.sessions) return true;
+
+        const deletedSessions = mergeDeletedSessions(
+          loadDeletedSessions(),
+          remote.deletedSessions ?? {},
+        );
+        saveDeletedSessions(deletedSessions);
 
         applyingRemote = true;
         try {
-          const local = getLocalChatState();
-          const merged = mergeChatState(local, remote);
+          // Tombstones are applied before the normal session/message merge.
+          // This makes deletion win over an old D1 snapshot and prevents the
+          // deleted conversation from appearing again after refresh or on a
+          // second browser.
+          const local = filterDeletedSessions(
+            getLocalChatState(),
+            deletedSessions,
+          );
+          const remoteChatState = filterDeletedSessions(
+            remote,
+            deletedSessions,
+          ) as ChatSyncState;
+          const merged = mergeChatState(local, remoteChatState);
+          merged.sessions = merged.sessions.filter(
+            (session) => !deletedSessions[session.id],
+          );
           setLocalChatState(merged);
         } finally {
           applyingRemote = false;
@@ -158,13 +274,25 @@ export function D1ChatSync() {
       await waitForChatHydration();
       if (disposed) return;
 
+      // Capture the local IDs before pulling. This lets a deletion that was
+      // made shortly before a refresh remain represented by its localStorage
+      // tombstone while the stale D1 snapshot is being merged.
+      knownSessionIds = new Set(
+        useChatStore.getState().sessions.map((session) => session.id),
+      );
+
       const reachable = await pull();
       if (disposed) return;
 
       ready = reachable;
       if (!ready) return;
 
-      unsubscribe = useChatStore.subscribe(() => {
+      knownSessionIds = new Set(
+        useChatStore.getState().sessions.map((session) => session.id),
+      );
+
+      unsubscribe = useChatStore.subscribe((state) => {
+        trackLocalSessionChanges(state.sessions);
         schedulePush();
       });
 
