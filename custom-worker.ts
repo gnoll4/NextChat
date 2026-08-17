@@ -5,6 +5,7 @@ const DEEPSEEK_PROXY_PREFIX = "/api/deepseek";
 const D1_SYNC_PATH = "/api/sync/d1";
 const DEFAULT_DEEPSEEK_URL = "https://api.deepseek.com";
 const ACCESS_CODE_PREFIX = "nk-";
+const DEEPSEEK_MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 
 const D1_CHUNK_CHAR_SIZE = 400_000;
 const D1_MAX_STATE_CHARS = 8_000_000;
@@ -102,27 +103,52 @@ async function proxyDeepSeek(request: Request, env: any) {
     headers.set("Authorization", `Bearer ${apiKey}`);
   }
 
-  const init: RequestInit & { duplex?: "half" } = {
-    method: request.method,
-    headers,
-    redirect: "manual",
-    signal: request.signal,
-  };
-
-  if (request.method !== "GET" && request.method !== "HEAD") {
-    // Keep long chat requests as streams. Never buffer or parse the JSON body
-    // inside the Worker; the payload size should not materially change CPU use.
-    init.body = request.body;
-    init.duplex = "half";
-  }
-
   try {
-    const upstream = await fetch(upstreamUrl, init);
+    let requestBody: Uint8Array | undefined;
+
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      const declaredLength = Number(request.headers.get("content-length") || 0);
+      if (declaredLength > DEEPSEEK_MAX_REQUEST_BYTES) {
+        return errorResponse(
+          `DeepSeek request is too large (${declaredLength} bytes; max ${DEEPSEEK_MAX_REQUEST_BYTES})`,
+          413,
+        );
+      }
+
+      const bodyBuffer = await request.arrayBuffer();
+      if (bodyBuffer.byteLength > DEEPSEEK_MAX_REQUEST_BYTES) {
+        return errorResponse(
+          `DeepSeek request is too large (${bodyBuffer.byteLength} bytes; max ${DEEPSEEK_MAX_REQUEST_BYTES})`,
+          413,
+        );
+      }
+
+      // Cloudflare sends a generic ReadableStream request body with chunked
+      // transfer encoding. DeepSeek's gateway has proved unreliable for large
+      // follow-up requests in that form, so send a fixed-length byte body.
+      // The response remains fully streamed below; only the request is bounded
+      // and buffered, with a strict 16 MiB safety limit.
+      requestBody = new Uint8Array(bodyBuffer);
+    }
+
+    const upstreamRequest = new Request(upstreamUrl, {
+      method: request.method,
+      headers,
+      body: requestBody,
+      redirect: "manual",
+      signal: request.signal,
+    });
+
+    const upstream = await fetch(upstreamRequest);
     const responseHeaders = new Headers(upstream.headers);
     responseHeaders.delete("www-authenticate");
     responseHeaders.set("X-Accel-Buffering", "no");
     responseHeaders.set("Cache-Control", "no-store");
-    responseHeaders.set("X-NextChat-DeepSeek-Proxy", "raw");
+    responseHeaders.set("X-NextChat-DeepSeek-Proxy", "fixed-length-request");
+    responseHeaders.set(
+      "X-NextChat-DeepSeek-Request-Bytes",
+      String(requestBody?.byteLength ?? 0),
+    );
 
     return new Response(upstream.body, {
       status: upstream.status,
@@ -312,8 +338,6 @@ async function handleD1Sync(request: Request, env: any) {
       );
     }
 
-    // Unlike the DeepSeek path, D1 needs string chunks. Keep a strict maximum
-    // so this small sync endpoint can never consume most of the Worker's isolate.
     const serialized = await request.text();
     if (!serialized) {
       return d1Response(
@@ -393,7 +417,6 @@ export default {
   async fetch(request: Request, env: any, ctx: any) {
     const url = new URL(request.url);
 
-    // Keep the two potentially heavy API paths out of Next.js/OpenNext.
     if (url.pathname.startsWith(`${DEEPSEEK_PROXY_PREFIX}/`)) {
       return proxyDeepSeek(request, env);
     }
