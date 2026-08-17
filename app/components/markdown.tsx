@@ -267,7 +267,54 @@ function tryWrapHtmlCode(text: string) {
     );
 }
 
-function _MarkDownContent(props: { content: string }) {
+type ThinkingSplit = {
+  thinking: string;
+  answer: string;
+  complete: boolean;
+} | null;
+
+function splitLeadingThinking(content: string): ThinkingSplit {
+  if (!content.startsWith("> ")) return null;
+
+  let cursor = 0;
+  let boundary = -1;
+
+  while (cursor < content.length) {
+    const nextParagraph = content.indexOf("\n\n", cursor);
+    if (nextParagraph < 0) break;
+
+    const afterBreak = content.slice(nextParagraph + 2);
+    if (!afterBreak.startsWith("> ")) {
+      boundary = nextParagraph;
+      break;
+    }
+    cursor = nextParagraph + 2;
+  }
+
+  const thinkingRaw = boundary >= 0 ? content.slice(0, boundary) : content;
+  const answer = boundary >= 0 ? content.slice(boundary + 2) : "";
+  const thinking = thinkingRaw
+    .split("\n")
+    .map((line) => (line.startsWith("> ") ? line.slice(2) : line))
+    .join("\n")
+    .trim();
+
+  // DeepSeek reasoning is normally much longer than a short quoted sentence.
+  // Keep ordinary short blockquotes rendered normally instead of folding them.
+  const quoteParagraphs = (thinkingRaw.match(/\n\n> /g) || []).length + 1;
+  const looksLikeThinking =
+    thinking.length >= 120 || quoteParagraphs >= 2 || (!answer && thinking.length >= 60);
+
+  if (!looksLikeThinking) return null;
+
+  return {
+    thinking,
+    answer,
+    complete: boundary >= 0,
+  };
+}
+
+function RawMarkdownContent(props: { content: string }) {
   const escapedContent = useMemo(() => {
     return tryWrapHtmlCode(escapeBrackets(props.content));
   }, [props.content]);
@@ -313,6 +360,75 @@ function _MarkDownContent(props: { content: string }) {
     >
       {escapedContent}
     </ReactMarkdown>
+  );
+}
+
+function ThinkingBlock(props: { content: string; complete: boolean }) {
+  const [open, setOpen] = useState(!props.complete);
+
+  useEffect(() => {
+    // Keep live reasoning visible. As soon as the final answer starts, collapse
+    // it automatically; completed historical messages therefore start folded.
+    setOpen(!props.complete);
+  }, [props.complete]);
+
+  return (
+    <details
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+      style={{
+        margin: "6px 0 12px",
+        border: "1px solid rgba(128, 128, 128, 0.24)",
+        borderRadius: 8,
+        background: "rgba(128, 128, 128, 0.06)",
+        overflow: "hidden",
+      }}
+    >
+      <summary
+        style={{
+          cursor: "pointer",
+          userSelect: "none",
+          padding: "8px 10px",
+          fontSize: "0.92em",
+          opacity: 0.78,
+        }}
+      >
+        {props.complete ? "已完成思考" : "正在思考…"}
+      </summary>
+      <div
+        style={{
+          padding: "0 12px 10px",
+          maxHeight: 420,
+          overflowY: "auto",
+          opacity: 0.82,
+        }}
+      >
+        <RawMarkdownContent content={props.content} />
+      </div>
+    </details>
+  );
+}
+
+function _MarkDownContent(props: { content: string }) {
+  const thinkingSplit = useMemo(
+    () => splitLeadingThinking(props.content),
+    [props.content],
+  );
+
+  if (!thinkingSplit) {
+    return <RawMarkdownContent content={props.content} />;
+  }
+
+  return (
+    <>
+      <ThinkingBlock
+        content={thinkingSplit.thinking}
+        complete={thinkingSplit.complete}
+      />
+      {thinkingSplit.answer && (
+        <RawMarkdownContent content={thinkingSplit.answer} />
+      )}
+    </>
   );
 }
 

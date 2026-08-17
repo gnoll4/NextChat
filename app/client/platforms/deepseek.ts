@@ -43,6 +43,9 @@ const DEEPSEEK_RAW_HISTORY_HARD_CAP_TOKENS = 48_000;
 const DEEPSEEK_MEMORY_RECENT_HARD_CAP_TOKENS = 32_000;
 const DEEPSEEK_MEMORY_PROMPT_HARD_CAP_TOKENS = 12_000;
 const DEEPSEEK_MEMORY_CONTINUITY_TOKENS = 12_000;
+const DEEPSEEK_PINNED_USER_INPUT_HARD_CAP_TOKENS = 48_000;
+const DEEPSEEK_LARGE_LOCAL_INPUT_MIN_LINES = 120;
+const DEEPSEEK_LARGE_LOCAL_INPUT_MIN_TOKENS = 4_000;
 const DEEPSEEK_NON_STREAM_MAX_OUTPUT_TOKENS = 8_000;
 const DEEPSEEK_MIN_PARTIAL_MESSAGE_TOKENS = 2_000;
 
@@ -138,6 +141,38 @@ function cleanPersistedMessages(messages: any[]) {
 
     return true;
   });
+}
+
+function isLargeLocalUserMessage(message: any) {
+  if (!message || message.role !== "user" || isErrorMessage(message)) {
+    return false;
+  }
+
+  const text = getDeepSeekTextContent(message).trim();
+  if (!text) return false;
+
+  const lineCount = text.split(/\r?\n/).length;
+  const tokenCount = estimateTokenLength(text);
+
+  return (
+    lineCount >= DEEPSEEK_LARGE_LOCAL_INPUT_MIN_LINES ||
+    (lineCount >= 60 && tokenCount >= DEEPSEEK_LARGE_LOCAL_INPUT_MIN_TOKENS)
+  );
+}
+
+function hasLargeLocalInput(messages: any[]) {
+  return messages.some(isLargeLocalUserMessage);
+}
+
+function hasExplicitWebSearchIntent(messages: any[]) {
+  const latestUser = [...messages]
+    .reverse()
+    .find((message) => message?.role === "user" && !isErrorMessage(message));
+  const text = latestUser ? getDeepSeekTextContent(latestUser).toLowerCase() : "";
+
+  return /(联网|上网|搜索|搜一下|查一下|查找|最新资料|最新文档|官网|web\s*search|search\s+the\s+web|look\s+up|latest\s+docs)/i.test(
+    text,
+  );
 }
 
 function truncateTextToTokenBudget(
@@ -681,6 +716,8 @@ export class DeepSeekApi implements LLMApi {
       let contextMode: "summary" | "memory-pending" | "raw-capped";
       let rawHistoryTokenBudget = 0;
       let continuityTokenBudget = 0;
+      let pinnedUserTokenBudget = 0;
+      let pinnedUserTokens = 0;
 
       if (hasValidMemory) {
         contextMode = "summary";
@@ -692,9 +729,27 @@ export class DeepSeekApi implements LLMApi {
           persistedHistory.slice(summarizeBoundary),
         );
 
+        // A memory summary is useful for prose history, but it is not a lossless
+        // replacement for source code. Rehydrate recent large user pastes from
+        // persisted history so code sent across several turns remains exact even
+        // after those turns have crossed the summarize boundary.
+        pinnedUserTokenBudget = Math.min(
+          DEEPSEEK_PINNED_USER_INPUT_HARD_CAP_TOKENS,
+          availableHistoryBudget,
+        );
+        const pinnedUserInputs = trimMessagesToTokenBudget(
+          summarizedHistory.filter(isLargeLocalUserMessage),
+          pinnedUserTokenBudget,
+        );
+        pinnedUserTokens = countDeepSeekMessageTokens(pinnedUserInputs);
+        const historyBudgetAfterPinned = Math.max(
+          0,
+          availableHistoryBudget - pinnedUserTokens,
+        );
+
         rawHistoryTokenBudget = Math.min(
           DEEPSEEK_MEMORY_RECENT_HARD_CAP_TOKENS,
-          Math.max(0, availableHistoryBudget),
+          historyBudgetAfterPinned,
         );
         const recentMessages = trimMessagesToTokenBudget(
           unsummarizedHistory,
@@ -704,7 +759,10 @@ export class DeepSeekApi implements LLMApi {
 
         continuityTokenBudget = Math.min(
           DEEPSEEK_MEMORY_CONTINUITY_TOKENS,
-          Math.max(0, availableHistoryBudget - recentTokenCount),
+          Math.max(
+            0,
+            historyBudgetAfterPinned - recentTokenCount,
+          ),
         );
         const continuityPrompt = buildContinuityPrompt(
           summarizedHistory,
@@ -714,6 +772,7 @@ export class DeepSeekApi implements LLMApi {
         sourceMessages = [
           ...supplementalMessages,
           ...(continuityPrompt ? [continuityPrompt] : []),
+          ...pinnedUserInputs,
           ...recentMessages,
         ];
       } else {
@@ -746,6 +805,8 @@ export class DeepSeekApi implements LLMApi {
         supplementalTokens: Math.round(supplementalTokenCount),
         storedMemoryPromptTokens: Math.round(storedMemoryPromptTokens),
         memoryPromptTransportCap: DEEPSEEK_MEMORY_PROMPT_HARD_CAP_TOKENS,
+        pinnedUserTokenBudget,
+        pinnedUserTokens: Math.round(pinnedUserTokens),
         rawHistoryTokenBudget,
         continuityTokenBudget,
         configuredInputTokenBudget: configuredContextTokenBudget,
@@ -755,7 +816,9 @@ export class DeepSeekApi implements LLMApi {
       console.log(
         `[DeepSeek Context Tokens] selected=${selectedInputTokens} supplemental=${Math.round(
           supplementalTokenCount,
-        )} storedMemory=${Math.round(storedMemoryPromptTokens)}`,
+        )} storedMemory=${Math.round(storedMemoryPromptTokens)} pinnedUser=${Math.round(
+          pinnedUserTokens,
+        )}`,
       );
     }
 
@@ -788,12 +851,31 @@ export class DeepSeekApi implements LLMApi {
     const controller = new AbortController();
     options.onController?.(controller);
 
+    const largeLocalInput = hasLargeLocalInput(filteredMessages as any[]);
+    const explicitWebSearch = hasExplicitWebSearchIntent(
+      filteredMessages as any[],
+    );
+    const useNativeSearch =
+      shouldStream &&
+      isInteractiveTurn &&
+      (!largeLocalInput || explicitWebSearch);
+
+    console.log("[DeepSeek Route]", {
+      route: useNativeSearch
+        ? "anthropic-native-search"
+        : "chat-completions",
+      largeLocalInput,
+      explicitWebSearch,
+      selectedThinkingLevel: thinkingLevel,
+    });
+
     try {
-      // Normal interactive DeepSeek chat always has native web search available.
-      // The server tool uses tool_choice:auto, so the model decides whether a
-      // search is actually needed. Internal title/summarization calls continue
-      // to use Chat Completions and therefore do not trigger unnecessary search.
-      if (shouldStream && isInteractiveTurn) {
+      // Native search remains available for normal interactive chat. Large
+      // pasted local material (especially code) stays on Chat Completions so it
+      // does not pay the reliability/latency cost of the Anthropic server-side
+      // web_search tool when no web data is required. An explicit search request
+      // from the user still opts back into native search.
+      if (useNativeSearch) {
         const anthropicInput = buildAnthropicMessages(filteredMessages);
         const nativeSearchPayload: DeepSeekAnthropicRequestPayload = {
           model: modelConfig.model,
