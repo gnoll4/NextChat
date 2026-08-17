@@ -10,16 +10,7 @@
     "edge-api": {
       "name": "nextchat-edge-api",
       "workers_dev": false,
-      "routes": [
-        {
-          "pattern": "chat.gnoll.top/api/deepseek/*",
-          "zone_name": "gnoll.top"
-        },
-        {
-          "pattern": "chat.gnoll.top/api/sync/d1*",
-          "zone_name": "gnoll.top"
-        }
-      ],
+      "routes": [],
       "vars": {
         "DEEPSEEK_URL": "https://api.deepseek.com"
       },
