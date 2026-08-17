@@ -17,19 +17,6 @@
     "global_fetch_strictly_public"
   ],
 
-  "find_additional_modules": true,
-  "base_dir": ".",
-  "preserve_file_names": true,
-  "rules": [
-    {
-      "type": "ESModule",
-      "globs": [
-        "./.open-next/**/*.js",
-        "./.open-next/**/*.mjs"
-      ]
-    }
-  ],
-
   "vars": {
     "DEEPSEEK_URL": "https://api.deepseek.com",
     "HIDE_USER_API_KEY": "1"
