@@ -74,6 +74,13 @@ function buildLocalSyncState(): D1ChatSyncState {
   };
 }
 
+function isChatStreaming() {
+  return useChatStore.getState().sessions.some((session) => {
+    const lastMessage = session.messages.at(-1);
+    return lastMessage?.role === "assistant" && lastMessage.streaming === true;
+  });
+}
+
 async function waitForChatHydration() {
   if (useChatStore.getState()._hasHydrated) return;
 
@@ -99,8 +106,15 @@ export function D1ChatSync() {
     let unsubscribe: (() => void) | undefined;
     let knownSessionIds = new Set<string>();
 
+    const cancelScheduledPush = () => {
+      if (pushTimer) {
+        clearTimeout(pushTimer);
+        pushTimer = undefined;
+      }
+    };
+
     const push = async () => {
-      if (disposed || !ready || applyingRemote) return;
+      if (disposed || !ready || applyingRemote || isChatStreaming()) return;
 
       if (pushInFlight) {
         pushAgain = true;
@@ -109,9 +123,6 @@ export function D1ChatSync() {
 
       pushInFlight = true;
       try {
-        // Serialize in the browser and send the JSON string directly. The
-        // Worker stores this payload as opaque text, avoiding large JSON parse
-        // and stringify work on Cloudflare's CPU budget.
         const serialized = JSON.stringify(buildLocalSyncState());
         const response = await fetch(SYNC_API, {
           method: "POST",
@@ -138,8 +149,9 @@ export function D1ChatSync() {
     };
 
     const schedulePush = () => {
-      if (!ready || applyingRemote || disposed) return;
-      if (pushTimer) clearTimeout(pushTimer);
+      cancelScheduledPush();
+      if (!ready || applyingRemote || disposed || isChatStreaming()) return;
+
       pushTimer = setTimeout(() => {
         pushTimer = undefined;
         void push();
@@ -152,9 +164,6 @@ export function D1ChatSync() {
       const deletedAt = Date.now();
       let changed = false;
 
-      // A session that disappeared locally is a real deletion, not merely an
-      // absent remote record. Persist a tombstone immediately so even a page
-      // refresh before the next D1 upload cannot resurrect it.
       knownSessionIds.forEach((sessionId) => {
         if (!currentIds.has(sessionId)) {
           deletedSessions[sessionId] = Math.max(
@@ -165,9 +174,6 @@ export function D1ChatSync() {
         }
       });
 
-      // NextChat's delete action has a short Undo window. If the same session
-      // ID reappears locally before the tombstone is synced, treat that as an
-      // undo and remove the local tombstone.
       currentIds.forEach((sessionId) => {
         if (!knownSessionIds.has(sessionId) && deletedSessions[sessionId]) {
           delete deletedSessions[sessionId];
@@ -182,6 +188,13 @@ export function D1ChatSync() {
 
     const pull = async () => {
       if (disposed) return false;
+
+      // Never compete with a live DeepSeek SSE connection for the same Worker
+      // isolate. The next focus event or post-stream store update will retry.
+      if (isChatStreaming()) {
+        lastPullAt = Date.now();
+        return true;
+      }
 
       try {
         const response = await fetch(SYNC_API, {
@@ -198,7 +211,6 @@ export function D1ChatSync() {
           return false;
         }
 
-        // 204 means this Access user has no remote snapshot yet.
         if (response.status === 204) {
           return true;
         }
@@ -223,10 +235,6 @@ export function D1ChatSync() {
 
         applyingRemote = true;
         try {
-          // Tombstones are applied before the normal session/message merge.
-          // This makes deletion win over an old D1 snapshot and prevents the
-          // deleted conversation from appearing again after refresh or on a
-          // second browser.
           const local = filterDeletedSessions(
             getLocalChatState(),
             deletedSessions,
@@ -254,6 +262,7 @@ export function D1ChatSync() {
     const onFocus = () => {
       if (
         ready &&
+        !isChatStreaming() &&
         Date.now() - lastPullAt >= FOCUS_PULL_MIN_INTERVAL_MS
       ) {
         void pull();
@@ -263,9 +272,7 @@ export function D1ChatSync() {
     const onVisibilityChange = () => {
       if (document.visibilityState === "visible") {
         onFocus();
-      } else if (ready) {
-        // Do not force an immediate full-state upload when the tab is hidden.
-        // Keep the normal debounce so rapid tab switching cannot hammer D1.
+      } else if (ready && !isChatStreaming()) {
         schedulePush();
       }
     };
@@ -274,9 +281,6 @@ export function D1ChatSync() {
       await waitForChatHydration();
       if (disposed) return;
 
-      // Capture the local IDs before pulling. This lets a deletion that was
-      // made shortly before a refresh remain represented by its localStorage
-      // tombstone while the stale D1 snapshot is being merged.
       knownSessionIds = new Set(
         useChatStore.getState().sessions.map((session) => session.id),
       );
@@ -293,24 +297,31 @@ export function D1ChatSync() {
 
       unsubscribe = useChatStore.subscribe((state) => {
         trackLocalSessionChanges(state.sessions);
+
+        // A live assistant message changes on every streamed chunk. Do not let
+        // those updates create D1 traffic. Once streaming flips to false, this
+        // same subscription schedules one normal debounced snapshot upload.
+        if (isChatStreaming()) {
+          cancelScheduledPush();
+          return;
+        }
+
         schedulePush();
       });
 
       window.addEventListener("focus", onFocus);
       document.addEventListener("visibilitychange", onVisibilityChange);
 
-      // If this browser has local chats that are not yet in D1, upload the
-      // merged snapshot later instead of immediately during page startup.
       schedulePush();
 
-      console.log("[D1 Sync] automatic chat sync enabled");
+      console.log("[D1 Sync] automatic chat sync enabled (paused during streams)");
     };
 
     void bootstrap();
 
     return () => {
       disposed = true;
-      if (pushTimer) clearTimeout(pushTimer);
+      cancelScheduledPush();
       unsubscribe?.();
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onVisibilityChange);

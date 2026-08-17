@@ -2,8 +2,15 @@
 import openNextWorker from "./.open-next/worker.js";
 
 const DEEPSEEK_PROXY_PREFIX = "/api/deepseek";
+const D1_SYNC_PATH = "/api/sync/d1";
 const DEFAULT_DEEPSEEK_URL = "https://api.deepseek.com";
 const ACCESS_CODE_PREFIX = "nk-";
+
+const D1_CHUNK_CHAR_SIZE = 400_000;
+const D1_MAX_STATE_CHARS = 8_000_000;
+const D1_MAX_CHUNKS = Math.ceil(D1_MAX_STATE_CHARS / D1_CHUNK_CHAR_SIZE);
+
+let d1SchemaReadyPromise: Promise<void> | null = null;
 
 function errorResponse(message: string, status = 500) {
   return new Response(JSON.stringify({ error: true, message }), {
@@ -31,8 +38,6 @@ function authorizeDeepSeek(request: Request, env: any) {
     .map((code) => code.trim())
     .filter(Boolean);
 
-  // Match the existing NextChat auth behavior without importing the Next.js
-  // auth stack. When CODE is configured, a valid nk- access code is required.
   if (configuredCodes.length > 0 && !configuredCodes.includes(accessCode)) {
     return {
       ok: false,
@@ -43,8 +48,6 @@ function authorizeDeepSeek(request: Request, env: any) {
     };
   }
 
-  // Preserve HIDE_USER_API_KEY: do not let callers turn this endpoint into a
-  // proxy for arbitrary user-supplied DeepSeek keys.
   if (env.HIDE_USER_API_KEY && isUserApiKey) {
     return {
       ok: false,
@@ -107,8 +110,8 @@ async function proxyDeepSeek(request: Request, env: any) {
   };
 
   if (request.method !== "GET" && request.method !== "HEAD") {
-    // Critical for long conversations: keep the request body as a stream.
-    // Never call text(), json(), arrayBuffer(), clone() or JSON.parse() here.
+    // Keep long chat requests as streams. Never buffer or parse the JSON body
+    // inside the Worker; the payload size should not materially change CPU use.
     init.body = request.body;
     init.duplex = "half";
   }
@@ -121,8 +124,6 @@ async function proxyDeepSeek(request: Request, env: any) {
     responseHeaders.set("Cache-Control", "no-store");
     responseHeaders.set("X-NextChat-DeepSeek-Proxy", "raw");
 
-    // Stream DeepSeek SSE/body back unchanged. No buffering or parsing in the
-    // Worker, so request CPU cost stays nearly independent of history length.
     return new Response(upstream.body, {
       status: upstream.status,
       statusText: upstream.statusText,
@@ -141,15 +142,264 @@ async function proxyDeepSeek(request: Request, env: any) {
   }
 }
 
+function getD1UserId(request: Request) {
+  const email = request.headers.get("cf-access-authenticated-user-email");
+  if (email) return email.trim().toLowerCase();
+
+  const assertion = request.headers.get("cf-access-jwt-assertion");
+  if (!assertion) return null;
+
+  try {
+    const payloadPart = assertion.split(".")[1];
+    if (!payloadPart) return null;
+    const normalized = payloadPart.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(
+      normalized.length + ((4 - (normalized.length % 4)) % 4),
+      "=",
+    );
+    const payload = JSON.parse(atob(padded));
+    const jwtEmail = payload?.email;
+    return typeof jwtEmail === "string"
+      ? jwtEmail.trim().toLowerCase()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function getD1(env: any) {
+  const db = env.NEXTCHAT_DB;
+  if (!db?.prepare) {
+    throw new Error(
+      "D1 binding NEXTCHAT_DB is unavailable. Bind your D1 database with variable name NEXTCHAT_DB.",
+    );
+  }
+  return db;
+}
+
+async function ensureD1Schema(db: any) {
+  if (!d1SchemaReadyPromise) {
+    d1SchemaReadyPromise = Promise.all([
+      db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS nextchat_sync_meta (
+            user_id TEXT PRIMARY KEY,
+            version TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            chunk_count INTEGER NOT NULL
+          )`,
+        )
+        .run(),
+      db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS nextchat_sync_chunks (
+            user_id TEXT NOT NULL,
+            version TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            data TEXT NOT NULL,
+            PRIMARY KEY (user_id, version, chunk_index)
+          )`,
+        )
+        .run(),
+    ])
+      .then(() => undefined)
+      .catch((error) => {
+        d1SchemaReadyPromise = null;
+        throw error;
+      });
+  }
+
+  return d1SchemaReadyPromise;
+}
+
+function d1Response(
+  body: BodyInit | null,
+  status: number,
+  extraHeaders?: Record<string, string>,
+) {
+  return new Response(body, {
+    status,
+    headers: {
+      "Cache-Control": "no-store",
+      "X-NextChat-D1-Proxy": "raw",
+      ...(extraHeaders ?? {}),
+    },
+  });
+}
+
+async function handleD1Sync(request: Request, env: any) {
+  const userId = getD1UserId(request);
+  if (!userId) {
+    return d1Response(
+      JSON.stringify({ error: "Cloudflare Access identity not found" }),
+      401,
+      { "Content-Type": "application/json; charset=utf-8" },
+    );
+  }
+
+  if (request.method !== "GET" && request.method !== "POST") {
+    return d1Response(null, 405, { Allow: "GET, POST" });
+  }
+
+  try {
+    const db = getD1(env);
+    await ensureD1Schema(db);
+
+    if (request.method === "GET") {
+      const meta = await db
+        .prepare(
+          `SELECT version, updated_at, chunk_count
+           FROM nextchat_sync_meta
+           WHERE user_id = ?1`,
+        )
+        .bind(userId)
+        .first();
+
+      if (!meta) {
+        return d1Response(null, 204, {
+          "X-NextChat-Updated-At": "0",
+        });
+      }
+
+      const chunkCount = Number(meta.chunk_count) || 0;
+      if (chunkCount < 0 || chunkCount > D1_MAX_CHUNKS) {
+        return d1Response(
+          JSON.stringify({
+            error: "D1 sync snapshot is too large for automatic restore",
+          }),
+          413,
+          { "Content-Type": "application/json; charset=utf-8" },
+        );
+      }
+
+      const rows = await db
+        .prepare(
+          `SELECT chunk_index, data
+           FROM nextchat_sync_chunks
+           WHERE user_id = ?1 AND version = ?2
+           ORDER BY chunk_index ASC`,
+        )
+        .bind(userId, meta.version)
+        .all();
+
+      const chunks = rows?.results ?? [];
+      if (chunks.length !== chunkCount) {
+        return d1Response(
+          JSON.stringify({ error: "D1 sync state is incomplete" }),
+          409,
+          { "Content-Type": "application/json; charset=utf-8" },
+        );
+      }
+
+      const serialized = chunks
+        .map((row: any) => String(row.data ?? ""))
+        .join("");
+
+      return d1Response(serialized, 200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "X-NextChat-Updated-At": String(Number(meta.updated_at) || 0),
+      });
+    }
+
+    const contentLength = Number(request.headers.get("content-length") || 0);
+    if (contentLength > D1_MAX_STATE_CHARS * 4) {
+      return d1Response(
+        JSON.stringify({
+          error: "Chat sync state is too large for automatic D1 sync",
+        }),
+        413,
+        { "Content-Type": "application/json; charset=utf-8" },
+      );
+    }
+
+    // Unlike the DeepSeek path, D1 needs string chunks. Keep a strict maximum
+    // so this small sync endpoint can never consume most of the Worker's isolate.
+    const serialized = await request.text();
+    if (!serialized) {
+      return d1Response(
+        JSON.stringify({ error: "Missing sync state" }),
+        400,
+        { "Content-Type": "application/json; charset=utf-8" },
+      );
+    }
+    if (serialized.length > D1_MAX_STATE_CHARS) {
+      return d1Response(
+        JSON.stringify({
+          error: "Chat sync state is too large for automatic D1 sync (8M characters limit)",
+        }),
+        413,
+        { "Content-Type": "application/json; charset=utf-8" },
+      );
+    }
+
+    const chunks: string[] = [];
+    for (let i = 0; i < serialized.length; i += D1_CHUNK_CHAR_SIZE) {
+      chunks.push(serialized.slice(i, i + D1_CHUNK_CHAR_SIZE));
+    }
+    if (chunks.length === 0) chunks.push("");
+
+    const version = `${Date.now()}-${crypto.randomUUID()}`;
+    const updatedAt = Date.now();
+
+    for (let index = 0; index < chunks.length; index += 1) {
+      await db
+        .prepare(
+          `INSERT INTO nextchat_sync_chunks
+             (user_id, version, chunk_index, data)
+           VALUES (?1, ?2, ?3, ?4)`,
+        )
+        .bind(userId, version, index, chunks[index])
+        .run();
+    }
+
+    await db
+      .prepare(
+        `INSERT INTO nextchat_sync_meta
+           (user_id, version, updated_at, chunk_count)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(user_id) DO UPDATE SET
+           version = excluded.version,
+           updated_at = excluded.updated_at,
+           chunk_count = excluded.chunk_count`,
+      )
+      .bind(userId, version, updatedAt, chunks.length)
+      .run();
+
+    await db
+      .prepare(
+        `DELETE FROM nextchat_sync_chunks
+         WHERE user_id = ?1 AND version <> ?2`,
+      )
+      .bind(userId, version)
+      .run();
+
+    return d1Response(null, 204, {
+      "X-NextChat-Updated-At": String(updatedAt),
+      "X-NextChat-Chunks": String(chunks.length),
+    });
+  } catch (error) {
+    console.error("[Raw D1 Sync]", error);
+    return d1Response(
+      JSON.stringify({
+        error: error instanceof Error ? error.message : String(error),
+      }),
+      500,
+      { "Content-Type": "application/json; charset=utf-8" },
+    );
+  }
+}
+
 export default {
   async fetch(request: Request, env: any, ctx: any) {
     const url = new URL(request.url);
 
-    // DeepSeek is the heavy long-context path. Bypass Next.js/OpenNext for it
-    // on BOTH the custom domain and workers.dev. Other UI/API requests still
-    // use the normal OpenNext worker.
+    // Keep the two potentially heavy API paths out of Next.js/OpenNext.
     if (url.pathname.startsWith(`${DEEPSEEK_PROXY_PREFIX}/`)) {
       return proxyDeepSeek(request, env);
+    }
+
+    if (url.pathname === D1_SYNC_PATH || url.pathname === `${D1_SYNC_PATH}/`) {
+      return handleD1Sync(request, env);
     }
 
     return openNextWorker.fetch(request, env, ctx);
