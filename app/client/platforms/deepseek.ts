@@ -164,13 +164,24 @@ function hasLargeLocalInput(messages: any[]) {
   return messages.some(isLargeLocalUserMessage);
 }
 
+function getDeepSeekMessageKey(message: any) {
+  if (message?.id) return `id:${message.id}`;
+  return `${message?.role ?? ""}:${getDeepSeekTextContent(
+    message,
+    message?.role === "assistant",
+  )}`;
+}
+
 function hasExplicitWebSearchIntent(messages: any[]) {
   const latestUser = [...messages]
     .reverse()
     .find((message) => message?.role === "user" && !isErrorMessage(message));
   const text = latestUser ? getDeepSeekTextContent(latestUser).toLowerCase() : "";
 
-  return /(联网|上网|搜索|搜一下|查一下|查找|最新资料|最新文档|官网|web\s*search|search\s+the\s+web|look\s+up|latest\s+docs)/i.test(
+  // Keep native web search opt-in. Generic words such as “搜索/查找” are common
+  // in code-analysis prompts, so they must not silently route local analysis to
+  // the Anthropic server-tool path.
+  return /(联网|上网|互联网搜索|网络搜索|在线搜索|搜索网页|查官网|官网.*(?:搜索|查)|最新(?:资料|文档|消息|新闻)|web\s*search|search\s+the\s+web|look\s+up\s+online|browse\s+the\s+web)/i.test(
     text,
   );
 }
@@ -729,19 +740,24 @@ export class DeepSeekApi implements LLMApi {
           persistedHistory.slice(summarizeBoundary),
         );
 
-        // A memory summary is useful for prose history, but it is not a lossless
-        // replacement for source code. Rehydrate recent large user pastes from
-        // persisted history so code sent across several turns remains exact even
-        // after those turns have crossed the summarize boundary.
+        // Memory summaries are intentionally lossy; source code is not. Read
+        // large user inputs directly from the raw persisted history BEFORE the
+        // failed-turn cleanup, so a code paste is still available even when the
+        // assistant response immediately after that paste failed.
         pinnedUserTokenBudget = Math.min(
           DEEPSEEK_PINNED_USER_INPUT_HARD_CAP_TOKENS,
           availableHistoryBudget,
         );
         const pinnedUserInputs = trimMessagesToTokenBudget(
-          summarizedHistory.filter(isLargeLocalUserMessage),
+          persistedHistory
+            .slice(clearContextIndex)
+            .filter(isLargeLocalUserMessage),
           pinnedUserTokenBudget,
         );
         pinnedUserTokens = countDeepSeekMessageTokens(pinnedUserInputs);
+        const pinnedMessageKeys = new Set(
+          pinnedUserInputs.map(getDeepSeekMessageKey),
+        );
         const historyBudgetAfterPinned = Math.max(
           0,
           availableHistoryBudget - pinnedUserTokens,
@@ -752,7 +768,9 @@ export class DeepSeekApi implements LLMApi {
           historyBudgetAfterPinned,
         );
         const recentMessages = trimMessagesToTokenBudget(
-          unsummarizedHistory,
+          unsummarizedHistory.filter(
+            (message) => !pinnedMessageKeys.has(getDeepSeekMessageKey(message)),
+          ),
           rawHistoryTokenBudget,
         );
         const recentTokenCount = countDeepSeekMessageTokens(recentMessages);
@@ -851,14 +869,18 @@ export class DeepSeekApi implements LLMApi {
     const controller = new AbortController();
     options.onController?.(controller);
 
-    const largeLocalInput = hasLargeLocalInput(filteredMessages as any[]);
+    const largeLocalInput =
+      hasLargeLocalInput(persistedMessages.slice(0, -1) as any[]) ||
+      hasLargeLocalInput(filteredMessages as any[]);
     const explicitWebSearch = hasExplicitWebSearchIntent(
       filteredMessages as any[],
     );
+    // Native Anthropic web_search is opt-in only. Normal conversation, code
+    // analysis, long text and thinking all stay on the officially supported
+    // OpenAI-compatible Chat Completions path unless the user explicitly asks
+    // for web access.
     const useNativeSearch =
-      shouldStream &&
-      isInteractiveTurn &&
-      (!largeLocalInput || explicitWebSearch);
+      shouldStream && isInteractiveTurn && explicitWebSearch;
 
     console.log("[DeepSeek Route]", {
       route: useNativeSearch
@@ -870,11 +892,6 @@ export class DeepSeekApi implements LLMApi {
     });
 
     try {
-      // Native search remains available for normal interactive chat. Large
-      // pasted local material (especially code) stays on Chat Completions so it
-      // does not pay the reliability/latency cost of the Anthropic server-side
-      // web_search tool when no web data is required. An explicit search request
-      // from the user still opts back into native search.
       if (useNativeSearch) {
         const anthropicInput = buildAnthropicMessages(filteredMessages);
         const nativeSearchPayload: DeepSeekAnthropicRequestPayload = {
@@ -908,7 +925,7 @@ export class DeepSeekApi implements LLMApi {
           configuredContextTokenBudget,
           effectiveContextTokenBudget: contextTokenBudget,
           selectedThinkingLevel: thinkingLevel,
-          webSearch: "auto",
+          webSearch: "explicit",
           maxSearchUses: DEEPSEEK_NATIVE_SEARCH_MAX_USES,
         });
 

@@ -299,11 +299,15 @@ function splitLeadingThinking(content: string): ThinkingSplit {
     .join("\n")
     .trim();
 
-  // DeepSeek reasoning is normally much longer than a short quoted sentence.
-  // Keep ordinary short blockquotes rendered normally instead of folding them.
+  // Once a final answer follows the leading quoted block, it is the completed
+  // DeepSeek reasoning section. While reasoning is still streaming, keep a
+  // length guard so ordinary short blockquotes are not mistaken for thinking.
   const quoteParagraphs = (thinkingRaw.match(/\n\n> /g) || []).length + 1;
   const looksLikeThinking =
-    thinking.length >= 120 || quoteParagraphs >= 2 || (!answer && thinking.length >= 60);
+    boundary >= 0 ||
+    thinking.length >= 120 ||
+    quoteParagraphs >= 2 ||
+    thinking.length >= 60;
 
   if (!looksLikeThinking) return null;
 
@@ -364,13 +368,10 @@ function RawMarkdownContent(props: { content: string }) {
 }
 
 function ThinkingBlock(props: { content: string; complete: boolean }) {
-  const [open, setOpen] = useState(!props.complete);
-
-  useEffect(() => {
-    // Keep live reasoning visible. As soon as the final answer starts, collapse
-    // it automatically; completed historical messages therefore start folded.
-    setOpen(!props.complete);
-  }, [props.complete]);
+  // Always start collapsed. Streaming updates and the transition from reasoning
+  // to final answer must never reopen/close it automatically; only the user's
+  // own click changes this state.
+  const [open, setOpen] = useState(false);
 
   return (
     <details
