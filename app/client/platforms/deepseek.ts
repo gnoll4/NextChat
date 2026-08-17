@@ -36,14 +36,14 @@ const DEEPSEEK_MIN_CONTEXT_RESERVE_TOKENS = 16_000;
 const DEEPSEEK_NATIVE_SEARCH_MAX_USES = 3;
 const DEEPSEEK_ANTHROPIC_MAX_OUTPUT_TOKENS = 65_536;
 
-// A model supporting hundreds of thousands of tokens does not mean every turn
-// should resend hundreds of thousands of raw-history tokens through the
-// browser/Worker/upstream chain. Keep a transport-safe raw fallback, and when
-// memory is available use a much smaller recent window plus an exact tail from
-// the last summarized assistant response for long-form continuation.
-const DEEPSEEK_RAW_HISTORY_HARD_CAP_TOKENS = 160_000;
-const DEEPSEEK_MEMORY_RECENT_HARD_CAP_TOKENS = 80_000;
+// The configured 512K/850K value is the model capability ceiling, not a target
+// payload size. Keep each browser -> Worker -> DeepSeek request bounded so a
+// long conversation does not grow linearly with the amount of generated text.
+const DEEPSEEK_RAW_HISTORY_HARD_CAP_TOKENS = 48_000;
+const DEEPSEEK_MEMORY_RECENT_HARD_CAP_TOKENS = 32_000;
+const DEEPSEEK_MEMORY_PROMPT_HARD_CAP_TOKENS = 12_000;
 const DEEPSEEK_MEMORY_CONTINUITY_TOKENS = 12_000;
+const DEEPSEEK_NON_STREAM_MAX_OUTPUT_TOKENS = 8_000;
 const DEEPSEEK_MIN_PARTIAL_MESSAGE_TOKENS = 2_000;
 
 const DEEPSEEK_IMAGE_UNSUPPORTED_NOTICE =
@@ -184,6 +184,30 @@ function truncateMessageToTokenBudget(message: any, tokenBudget: number) {
     ...message,
     content,
   };
+}
+
+function capSupplementalMessages(messages: any[]) {
+  return messages.map((message) => {
+    // The synthesized memory prompt has no persisted message id. It used to be
+    // allowed through without any cap, so a very verbose old summary could make
+    // a supposedly summarized request large again. Preserve the newest portion
+    // of that summary and bound it independently from recent raw history.
+    if (message?.role !== "system" || message?.id) return message;
+
+    const text = getDeepSeekTextContent(message);
+    if (estimateTokenLength(text) <= DEEPSEEK_MEMORY_PROMPT_HARD_CAP_TOKENS) {
+      return message;
+    }
+
+    return {
+      ...message,
+      content: truncateTextToTokenBudget(
+        text,
+        DEEPSEEK_MEMORY_PROMPT_HARD_CAP_TOKENS,
+        true,
+      ),
+    };
+  });
 }
 
 function trimMessagesToTokenBudget(messages: any[], tokenBudget: number) {
@@ -620,11 +644,16 @@ export class DeepSeekApi implements LLMApi {
         persistedMessages.map((message: any) => message?.id).filter(Boolean),
       );
 
-      const supplementalMessages = (options.messages as any[]).filter(
-        (message: any) => !message?.id || !persistedIds.has(message.id),
+      const supplementalMessages = capSupplementalMessages(
+        (options.messages as any[]).filter(
+          (message: any) => !message?.id || !persistedIds.has(message.id),
+        ),
       );
       const supplementalTokenCount = countDeepSeekMessageTokens(
         supplementalMessages,
+      );
+      const storedMemoryPromptTokens = estimateTokenLength(
+        currentSession.memoryPrompt ?? "",
       );
 
       // Exclude the streaming assistant placeholder and respect an explicit
@@ -663,8 +692,6 @@ export class DeepSeekApi implements LLMApi {
           persistedHistory.slice(summarizeBoundary),
         );
 
-        // Keep recent unsummarized raw text bounded even on 512K/850K model
-        // configurations. The older portion is represented by memoryPrompt.
         rawHistoryTokenBudget = Math.min(
           DEEPSEEK_MEMORY_RECENT_HARD_CAP_TOKENS,
           Math.max(0, availableHistoryBudget),
@@ -692,10 +719,6 @@ export class DeepSeekApi implements LLMApi {
       } else {
         contextMode = modelConfig.sendMemory ? "memory-pending" : "raw-capped";
 
-        // If memory is disabled or a new summary is still being generated, raw
-        // history is still available, but it no longer grows all the way to the
-        // model's 460K/765K effective input budget. This is the safety net that
-        // keeps long conversations transportable even without a ready summary.
         rawHistoryTokenBudget = Math.min(
           DEEPSEEK_RAW_HISTORY_HARD_CAP_TOKENS,
           availableHistoryBudget,
@@ -709,21 +732,31 @@ export class DeepSeekApi implements LLMApi {
         ];
       }
 
+      const selectedInputTokens = Math.round(
+        countDeepSeekMessageTokens(sourceMessages),
+      );
+
       console.log("[DeepSeek Context]", {
         contextMode,
         memoryEnabled: Boolean(modelConfig.sendMemory),
         memoryReady: hasValidMemory,
         persistedMessages: persistedMessages.length,
         selectedMessages: sourceMessages.length,
-        selectedInputTokens: Math.round(
-          countDeepSeekMessageTokens(sourceMessages),
-        ),
+        selectedInputTokens,
+        supplementalTokens: Math.round(supplementalTokenCount),
+        storedMemoryPromptTokens: Math.round(storedMemoryPromptTokens),
+        memoryPromptTransportCap: DEEPSEEK_MEMORY_PROMPT_HARD_CAP_TOKENS,
         rawHistoryTokenBudget,
         continuityTokenBudget,
         configuredInputTokenBudget: configuredContextTokenBudget,
         effectiveInputTokenBudget: contextTokenBudget,
         reservedTokens: contextReserveTokens,
       });
+      console.log(
+        `[DeepSeek Context Tokens] selected=${selectedInputTokens} supplemental=${Math.round(
+          supplementalTokenCount,
+        )} storedMemory=${Math.round(storedMemoryPromptTokens)}`,
+      );
     }
 
     const messages: ChatOptions["messages"] = [];
@@ -866,6 +899,13 @@ export class DeepSeekApi implements LLMApi {
         model: modelConfig.model,
       };
 
+      if (!shouldStream) {
+        requestPayload.max_tokens = Math.min(
+          DEEPSEEK_NON_STREAM_MAX_OUTPUT_TOKENS,
+          Math.max(1_024, Number(modelConfig.max_tokens) || 4_000),
+        );
+      }
+
       if (thinkingLevel === "off") {
         requestPayload.thinking = { type: "disabled" };
         requestPayload.temperature = modelConfig.temperature;
@@ -884,6 +924,7 @@ export class DeepSeekApi implements LLMApi {
         configuredContextTokenBudget,
         effectiveContextTokenBudget: contextTokenBudget,
         selectedThinkingLevel: thinkingLevel,
+        maxOutputTokens: requestPayload.max_tokens,
         thinking: requestPayload.thinking,
         reasoningEffort: requestPayload.reasoning_effort,
       });
