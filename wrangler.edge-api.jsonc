@@ -4,17 +4,7 @@
   "main": "edge-api-worker.ts",
   "compatibility_date": "2026-08-15",
   "workers_dev": false,
-
-  "routes": [
-    {
-      "pattern": "chat.gnoll.top/api/deepseek/*",
-      "zone_name": "gnoll.top"
-    },
-    {
-      "pattern": "chat.gnoll.top/api/sync/d1*",
-      "zone_name": "gnoll.top"
-    }
-  ],
+  "routes": [],
 
   "vars": {
     "DEEPSEEK_URL": "https://api.deepseek.com"
