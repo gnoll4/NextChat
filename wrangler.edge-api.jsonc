@@ -1,24 +1,26 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "nextchat-edge-api",
+  "name": "nextchat",
   "main": "edge-api-worker.ts",
   "compatibility_date": "2026-08-15",
   "workers_dev": false,
   "routes": [],
 
-  "vars": {
-    "DEEPSEEK_URL": "https://api.deepseek.com"
-  },
-
-  "secrets": {
-    "required": ["DEEPSEEK_API_KEY"]
-  },
-
-  "d1_databases": [
-    {
-      "binding": "NEXTCHAT_DB",
-      "database_name": "netxtchat",
-      "database_id": "b8f23859-d06e-4a85-979b-32e2902a6ff8"
+  "env": {
+    "edge-api": {
+      "name": "nextchat-edge-api",
+      "workers_dev": false,
+      "routes": [],
+      "vars": {
+        "DEEPSEEK_URL": "https://api.deepseek.com"
+      },
+      "d1_databases": [
+        {
+          "binding": "NEXTCHAT_DB",
+          "database_name": "netxtchat",
+          "database_id": "b8f23859-d06e-4a85-979b-32e2902a6ff8"
+        }
+      ]
     }
-  ]
+  }
 }
