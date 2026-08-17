@@ -2,6 +2,7 @@ const DEEPSEEK_PROXY_PREFIX = "/api/deepseek";
 const D1_SYNC_PATH = "/api/sync/d1";
 const DEFAULT_DEEPSEEK_URL = "https://api.deepseek.com";
 const DEEPSEEK_MAX_REQUEST_BYTES = 16 * 1024 * 1024;
+const INTERNAL_ACCESS_HEADER = "x-nextchat-internal-access";
 
 const D1_CHUNK_CHAR_SIZE = 400_000;
 const D1_MAX_STATE_CHARS = 8_000_000;
@@ -20,17 +21,56 @@ function jsonError(message: string, status = 500) {
   });
 }
 
+function getCookie(request: Request, name: string) {
+  const cookie = request.headers.get("cookie") || "";
+  for (const part of cookie.split(";")) {
+    const item = part.trim();
+    if (!item.startsWith(`${name}=`)) continue;
+    return item.slice(name.length + 1);
+  }
+  return null;
+}
+
+function decodeJwtPayload(token: string | null) {
+  if (!token) return null;
+  try {
+    const payloadPart = token.split(".")[1];
+    if (!payloadPart) return null;
+    const normalized = payloadPart.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(
+      normalized.length + ((4 - (normalized.length % 4)) % 4),
+      "=",
+    );
+    return JSON.parse(atob(padded));
+  } catch {
+    return null;
+  }
+}
+
+function getAccessJwt(request: Request) {
+  return (
+    request.headers.get("cf-access-jwt-assertion") ||
+    getCookie(request, "CF_Authorization") ||
+    getCookie(request, "cf_authorization")
+  );
+}
+
 function hasAccessIdentity(request: Request) {
+  if (request.headers.get(INTERNAL_ACCESS_HEADER) === "service-binding") {
+    return true;
+  }
+
   return Boolean(
     request.headers.get("cf-access-authenticated-user-email") ||
-      request.headers.get("cf-access-jwt-assertion"),
+      getAccessJwt(request),
   );
 }
 
 async function proxyDeepSeek(request: Request, env: any) {
-  // This Worker is routed only on the Access-protected production hostname.
-  // Requiring the Access identity prevents the route from becoming a public
-  // proxy for the server-side DeepSeek API key if DNS/routing is changed later.
+  // This Worker has no public route and is reached from the Access-protected
+  // NextChat gateway through a Service Binding. The gateway explicitly marks
+  // those internal requests because Access origin headers are not guaranteed to
+  // survive a Worker-to-Worker hop unchanged.
   if (!hasAccessIdentity(request)) {
     return jsonError("Cloudflare Access identity not found", 401);
   }
@@ -167,25 +207,18 @@ function getD1UserId(request: Request) {
   const email = request.headers.get("cf-access-authenticated-user-email");
   if (email) return email.trim().toLowerCase();
 
-  const assertion = request.headers.get("cf-access-jwt-assertion");
-  if (!assertion) return null;
-
-  try {
-    const payloadPart = assertion.split(".")[1];
-    if (!payloadPart) return null;
-    const normalized = payloadPart.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = normalized.padEnd(
-      normalized.length + ((4 - (normalized.length % 4)) % 4),
-      "=",
-    );
-    const payload = JSON.parse(atob(padded));
-    const jwtEmail = payload?.email;
-    return typeof jwtEmail === "string"
-      ? jwtEmail.trim().toLowerCase()
-      : null;
-  } catch {
-    return null;
+  const payload = decodeJwtPayload(getAccessJwt(request));
+  const jwtEmail = payload?.email;
+  if (typeof jwtEmail === "string" && jwtEmail.trim()) {
+    return jwtEmail.trim().toLowerCase();
   }
+
+  const jwtSub = payload?.sub;
+  if (typeof jwtSub === "string" && jwtSub.trim()) {
+    return `access-sub:${jwtSub.trim()}`;
+  }
+
+  return null;
 }
 
 function getD1(env: any) {
